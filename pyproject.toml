@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlops-control-plane"
+description = "In-memory model registry demonstrating evaluation gates, controlled promotion, dataset fingerprints and distribution drift."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["fastapi>=0.141.1,<1","uvicorn[standard]>=0.52.4,<1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=9.1.1,<10","httpx>=0.28.1,<1","ruff>=0.16.7,<1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
