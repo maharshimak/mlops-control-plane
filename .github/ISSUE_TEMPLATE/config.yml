@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security policy
+    url: https://github.com/maharshimak/mlops-control-plane/security/policy
+    about: Report security concerns using the process defined in SECURITY.md.

@@ -1,0 +1,10 @@
+# Default ownership for this portfolio repository.
+* @maharshimak
+
+# Explicit review ownership for production-critical surfaces.
+/.github/ @maharshimak
+/src/ @maharshimak
+/tests/ @maharshimak
+/docs/ @maharshimak
+/Dockerfile @maharshimak
+/pyproject.toml @maharshimak
