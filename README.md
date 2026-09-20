@@ -1,5 +1,7 @@
 # ⚙️ MLOps Control Plane
 
+[Live Interactive Demo](https://maharshimak.github.io/makma-ai-os/projects/mlops-control-plane/) · [AI Systems Lab](https://maharshimak.github.io/makma-ai-os/projects/)
+
 A compact model lifecycle control plane for **registration, quality gates, promotion and drift monitoring**.
 
 ## Implemented
