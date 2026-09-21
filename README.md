@@ -6,6 +6,28 @@
 
 A compact model lifecycle control plane for **registration, quality gates, promotion and drift monitoring**.
 
+
+## Product contract — engineering upgrade
+
+**Problem and audience:** A lifecycle policy workbench for ML engineers deciding whether model evidence supports rollout.
+
+**Live tool:** https://maharshimak.github.io/makma-ai-os/projects/mlops-control-plane/
+
+**Implemented browser workflow:** Candidate artifact metadata, multiple directional metric thresholds, baseline deltas, promotion gate, normalized PSI, production/candidate snapshots, canary and rollback decisions, traffic recommendation and fingerprinted governance JSON.
+
+**Backend and parity contract:** Python CanarySnapshot now enforces integer requests, finite bounded probabilities and positive latency; rollout policies validate traffic and budgets. Browser mirrors core promotion/canary concepts and adds a combined orchestration gate: failed promotion or critical drift prevents advancement and rollback takes precedence.
+
+**Architecture:** `makma-ai-os/demo` is the shared web product source and Pages deployment. This repository owns its Python domain package. The central `tests/e2e` suite exercises all nine products; `tests/fixtures/python-parity.json` plus `scripts/generate_parity.py` guard shared mathematical contracts. Backend revisions used for regeneration are pinned in the central `backend-lock.json`.
+
+**Safety and limitations:** No infrastructure deployment or actual traffic changes. Model URI/fingerprint metadata and snapshots are user supplied. Manifest SHA-256 is reproducibility evidence, not a digital signature or verification of a remote artifact. Inputs are validated, rendered user values are escaped, and deterministic results are not presented as model inference.
+
+**Verification:** Run `python -m ruff check .` and `python -m pytest -q`. `tests/test_engineering_upgrade.py` protects the new rejection/correctness paths. Central web checks: `npm ci`, `npm test`, `npm run build`, `npx playwright install --with-deps chromium`, `npm run test:e2e`. CI gates publishing on browser interactions and validates all public URLs after deployment.
+
+**Highest-value next work:** Authenticated registry, signed artifacts and integration with a real rollout controller.
+
+**Provenance:** Independent MAK’MA Studio engineering implementation; examples are synthetic and no employer code or data is included. Existing MIT license applies.
+
+
 ## Implemented
 
 - model artifact registry
