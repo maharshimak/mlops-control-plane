@@ -81,33 +81,32 @@ class ModelRegistry:
             sort_keys=True,
             separators=(",", ":"),
         )
-        with closing(self._connect()) as connection:
-            with connection:
-                connection.execute(
-                    """
-                    INSERT INTO model_versions(
-                        model_key, name, version, artifact_uri, dataset_fingerprint,
-                        stage, evaluations_json, created_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(model_key) DO UPDATE SET
-                        artifact_uri = excluded.artifact_uri,
-                        dataset_fingerprint = excluded.dataset_fingerprint,
-                        stage = excluded.stage,
-                        evaluations_json = excluded.evaluations_json,
-                        created_at = excluded.created_at
-                    """,
-                    (
-                        model.key,
-                        model.name,
-                        model.version,
-                        model.artifact_uri,
-                        model.dataset_fingerprint,
-                        model.stage,
-                        payload,
-                        model.created_at,
-                    ),
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO model_versions(
+                    model_key, name, version, artifact_uri, dataset_fingerprint,
+                    stage, evaluations_json, created_at
                 )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(model_key) DO UPDATE SET
+                    artifact_uri = excluded.artifact_uri,
+                    dataset_fingerprint = excluded.dataset_fingerprint,
+                    stage = excluded.stage,
+                    evaluations_json = excluded.evaluations_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    model.key,
+                    model.name,
+                    model.version,
+                    model.artifact_uri,
+                    model.dataset_fingerprint,
+                    model.stage,
+                    payload,
+                    model.created_at,
+                ),
+            )
 
     def register(self, model: ModelVersion) -> ModelVersion:
         if model.key in self._models:
