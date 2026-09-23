@@ -36,3 +36,12 @@ class ModelVersion:
     @property
     def key(self) -> str:
         return f"{self.name}:{self.version}"
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleEvent:
+    model_key: str
+    from_stage: str | None
+    to_stage: str
+    reason: str
+    created_at: str = field(default_factory=utc_now)
