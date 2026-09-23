@@ -51,6 +51,15 @@ def register_model(request: RegisterRequest) -> dict[str, object]:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 
+@app.get("/v1/models/{name}/{version}/history")
+def model_history(name: str, version: str) -> list[dict[str, object]]:
+    try:
+        registry.get(name, version)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="model not found") from error
+    return [asdict(event) for event in registry.history(name, version)]
+
+
 @app.post("/v1/models/{name}/{version}/evaluations")
 def add_evaluation(
     name: str,
