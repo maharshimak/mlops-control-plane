@@ -149,7 +149,7 @@ print(r.get("demo", "1").stage)
 
 ## Configuration
 
-Configuration is supplied through Python function/constructor arguments. No credentials or environment file are needed for the offline example.
+Library use needs no credentials. The API stores state at `MLOPS_CP_DB_PATH` (default `./data/control-plane.db`) and accepts `MLOPS_CP_API_TOKEN` for authenticated remote access.
 
 ## Service and API schema
 
@@ -157,7 +157,7 @@ Configuration is supplied through Python function/constructor arguments. No cred
 python -m uvicorn mlops_cp.api:app --host 127.0.0.1 --port 8000
 ```
 
-Interactive endpoint schemas are at `http://127.0.0.1:8000/docs`; machine-readable schemas are at `/openapi.json`. These APIs have no built-in authentication. Use trusted local data and local access.
+Interactive endpoint schemas are at `http://127.0.0.1:8000/docs`; machine-readable schemas are at `/openapi.json`. The API is local-only by default. Set `MLOPS_CP_API_TOKEN` to enable bearer-authenticated remote access; registry reads and all lifecycle mutations then require `Authorization: Bearer <token>`.
 
 ## Container
 
