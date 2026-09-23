@@ -1,3 +1,4 @@
+import os
 from dataclasses import asdict
 
 from fastapi import FastAPI, HTTPException
@@ -6,8 +7,8 @@ from pydantic import BaseModel, Field
 from mlops_cp.models import Evaluation, ModelVersion
 from mlops_cp.registry import ModelRegistry
 
-app = FastAPI(title="MLOps Control Plane", version="0.1.0")
-registry = ModelRegistry()
+app = FastAPI(title="MLOps Control Plane", version="0.2.0")
+registry = ModelRegistry(os.environ.get("MLOPS_CP_DB_PATH", "./data/control-plane.db"))
 
 
 class RegisterRequest(BaseModel):
