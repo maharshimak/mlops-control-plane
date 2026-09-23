@@ -38,6 +38,7 @@ A compact model lifecycle control plane for **registration, quality gates, promo
 - Population Stability Index (PSI)
 - drift severity classification
 - durable SQLite-backed model registry for API lifecycle state, plus standalone JSONL utilities
+- immutable persisted lifecycle transition history for registration, candidate promotion, production promotion and archival
 - FastAPI service
 - tests
 - Docker
@@ -116,7 +117,7 @@ if decision.allowed:
 
 ## Scope and limitations
 
-The API registry is SQLite-backed by default and persists model versions, evaluations and stage transitions across restart. JSONL state, lineage and canary helpers remain separate utilities rather than deployment integrations. Artifact URIs are metadata; artifacts are not uploaded or cryptographically verified. Registered models enter through gates, but library callers receive mutable model objects and are trusted. Thresholds are supplied by callers rather than an independent governance authority. No authentication, external rollout controller or automated infrastructure rollback is implemented.
+The API registry is SQLite-backed by default and persists model versions, evaluations, current stages and immutable lifecycle transition events across restart. JSONL state, lineage and canary helpers remain separate utilities rather than deployment integrations. Artifact URIs are metadata; artifacts are not uploaded or cryptographically verified. Registered models enter through gates, but library callers receive mutable model objects and are trusted. Thresholds are supplied by callers rather than an independent governance authority. No authentication, external rollout controller or automated infrastructure rollback is implemented.
 
 ## Installation and development
 
@@ -177,7 +178,7 @@ docker run --rm -p 127.0.0.1:8000:8000 mlops-control-plane
 
 ## Next engineering work
 
-Transactional multi-writer persistence; immutable transition/event records; independent policy configuration; artifact checksums/signatures; authenticated approvals; real deployment adapters. These are planned work, not current capabilities.
+Transactional multi-writer persistence; independent policy configuration; artifact checksums/signatures; authenticated approvals; real deployment adapters. These are planned work, not current capabilities.
 
 ## Contributing and security
 
