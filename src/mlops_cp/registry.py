@@ -6,7 +6,7 @@ from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
 
-from mlops_cp.models import Evaluation, ModelVersion
+from mlops_cp.models import Evaluation, LifecycleEvent, ModelVersion
 from mlops_cp.policy import PromotionDecision, evaluate_promotion
 
 ALLOWED_STAGES = {"registered", "candidate", "production", "archived"}
@@ -16,6 +16,7 @@ class ModelRegistry:
     def __init__(self, database_path: str | None = None) -> None:
         self.database_path = database_path
         self._models: dict[str, ModelVersion] = {}
+        self._events: list[LifecycleEvent] = []
         if database_path is not None:
             self._initialize_storage()
             self._load()
@@ -44,6 +45,22 @@ class ModelRegistry:
                     created_at TEXT NOT NULL
                 )
                 """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lifecycle_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_key TEXT NOT NULL,
+                    from_stage TEXT,
+                    to_stage TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lifecycle_model "
+                "ON lifecycle_events(model_key, id)"
             )
             connection.commit()
 
@@ -108,6 +125,56 @@ class ModelRegistry:
                 ),
             )
 
+    def _record_transition(
+        self,
+        model: ModelVersion,
+        *,
+        from_stage: str | None,
+        to_stage: str,
+        reason: str,
+    ) -> None:
+        event = LifecycleEvent(
+            model_key=model.key,
+            from_stage=from_stage,
+            to_stage=to_stage,
+            reason=reason,
+        )
+        self._events.append(event)
+        if self.database_path is None:
+            return
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO lifecycle_events(
+                    model_key, from_stage, to_stage, reason, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event.model_key,
+                    event.from_stage,
+                    event.to_stage,
+                    event.reason,
+                    event.created_at,
+                ),
+            )
+
+    def history(self, name: str, version: str) -> list[LifecycleEvent]:
+        model_key = f"{name}:{version}"
+        if self.database_path is None:
+            return [event for event in self._events if event.model_key == model_key]
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT model_key, from_stage, to_stage, reason, created_at
+                FROM lifecycle_events
+                WHERE model_key = ?
+                ORDER BY id ASC
+                """,
+                (model_key,),
+            ).fetchall()
+        return [LifecycleEvent(**dict(row)) for row in rows]
+
     def register(self, model: ModelVersion) -> ModelVersion:
         if model.key in self._models:
             raise ValueError(f"Model version already exists: {model.key}")
@@ -115,6 +182,12 @@ class ModelRegistry:
             raise ValueError("New models must enter in the registered stage.")
         self._models[model.key] = model
         self._persist(model)
+        self._record_transition(
+            model,
+            from_stage=None,
+            to_stage="registered",
+            reason="model registered",
+        )
         return model
 
     def get(self, name: str, version: str) -> ModelVersion:
@@ -139,8 +212,16 @@ class ModelRegistry:
         model = self.get(name, version)
         decision = evaluate_promotion(model)
         if decision.allowed:
+            previous = model.stage
             model.stage = "candidate"
             self._persist(model)
+            if previous != "candidate":
+                self._record_transition(
+                    model,
+                    from_stage=previous,
+                    to_stage="candidate",
+                    reason="promotion policy satisfied",
+                )
         return decision
 
     def promote_production(self, name: str, version: str) -> None:
@@ -150,16 +231,24 @@ class ModelRegistry:
         if not evaluate_promotion(model).allowed:
             raise ValueError("Current evaluations no longer satisfy promotion policy.")
 
-        changed: list[ModelVersion] = []
+        changed: list[tuple[ModelVersion, str, str]] = []
         for other in self._models.values():
             if other.name == name and other.stage == "production":
+                previous = other.stage
                 other.stage = "archived"
-                changed.append(other)
+                changed.append((other, previous, "replaced by newer production version"))
 
+        previous = model.stage
         model.stage = "production"
-        changed.append(model)
-        for item in changed:
+        changed.append((model, previous, "candidate promoted to production"))
+        for item, from_stage, reason in changed:
             self._persist(item)
+            self._record_transition(
+                item,
+                from_stage=from_stage,
+                to_stage=item.stage,
+                reason=reason,
+            )
 
     def list(self) -> list[ModelVersion]:
         return sorted(
