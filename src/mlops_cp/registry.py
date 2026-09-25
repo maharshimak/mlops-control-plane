@@ -6,6 +6,7 @@ from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
 
+from mlops_cp.lifecycle import validate_transition
 from mlops_cp.models import Evaluation, LifecycleEvent, ModelVersion
 from mlops_cp.policy import PromotionDecision, evaluate_promotion
 
@@ -213,6 +214,7 @@ class ModelRegistry:
         decision = evaluate_promotion(model)
         if decision.allowed:
             previous = model.stage
+            validate_transition(previous, "candidate")
             model.stage = "candidate"
             self._persist(model)
             if previous != "candidate":
@@ -226,8 +228,7 @@ class ModelRegistry:
 
     def promote_production(self, name: str, version: str) -> None:
         model = self.get(name, version)
-        if model.stage != "candidate":
-            raise ValueError("Only candidate models may be promoted to production.")
+        validate_transition(model.stage, "production")
         if not evaluate_promotion(model).allowed:
             raise ValueError("Current evaluations no longer satisfy promotion policy.")
 
@@ -235,6 +236,7 @@ class ModelRegistry:
         for other in self._models.values():
             if other.name == name and other.stage == "production":
                 previous = other.stage
+                validate_transition(previous, "archived")
                 other.stage = "archived"
                 changed.append((other, previous, "replaced by newer production version"))
 
