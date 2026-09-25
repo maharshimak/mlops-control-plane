@@ -23,6 +23,8 @@ A compact model lifecycle control plane for **registration, quality gates, promo
 
 **Verification:** Run `python -m ruff check .` and `python -m pytest -q`. `tests/test_engineering_upgrade.py` protects the new rejection/correctness paths. Central web checks: `npm ci`, `npm test`, `npm run build`, `npx playwright install --with-deps chromium`, `npm run test:e2e`. CI gates publishing on browser interactions and validates all public URLs after deployment.
 
+**Lifecycle and deployment boundary:** model stages now follow an explicit one-way transition graph, and `HTTPDeploymentTarget` can carry bounded typed deploy/traffic/rollback commands to a configured infrastructure controller over HTTPS without embedding arbitrary shell execution in the policy engine.
+
 **Highest-value next work:** Authenticated registry, signed artifacts and integration with a real rollout controller.
 
 **Provenance:** Independent MAK’MA Studio engineering implementation; examples are synthetic and no employer code or data is included. Existing MIT license applies.
