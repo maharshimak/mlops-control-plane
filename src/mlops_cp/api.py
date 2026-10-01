@@ -58,7 +58,17 @@ async def require_auth(
         return
 
     client_host = request.client.host if request.client else ""
-    if client_host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+    host_header = request.headers.get("host", "").casefold()
+    local_host = (
+        host_header in {"localhost", "127.0.0.1", "[::1]", "testserver"}
+        or host_header.startswith("localhost:")
+        or host_header.startswith("127.0.0.1:")
+        or host_header.startswith("[::1]:")
+    )
+    if (
+        client_host not in {"127.0.0.1", "::1", "localhost", "testclient"}
+        or not local_host
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Remote access requires MLOPS_CP_API_TOKEN.",
