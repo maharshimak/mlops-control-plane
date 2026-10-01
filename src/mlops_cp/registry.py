@@ -95,6 +95,10 @@ class ModelRegistry:
             )
             self._models[model.key] = model
 
+    def _refresh(self) -> None:
+        if self.database_path is not None:
+            self._load()
+
     def _persist(self, model: ModelVersion) -> None:
         if self.database_path is None:
             return
@@ -181,6 +185,7 @@ class ModelRegistry:
         return [LifecycleEvent(**dict(row)) for row in rows]
 
     def register(self, model: ModelVersion) -> ModelVersion:
+        self._refresh()
         if model.key in self._models:
             raise ValueError(f"Model version already exists: {model.key}")
         if model.stage != "registered":
@@ -196,6 +201,7 @@ class ModelRegistry:
         return model
 
     def get(self, name: str, version: str) -> ModelVersion:
+        self._refresh()
         return self._models[f"{name}:{version}"]
 
     def add_evaluation(
@@ -309,6 +315,7 @@ class ModelRegistry:
         self._events.extend(events)
 
     def list(self) -> list[ModelVersion]:
+        self._refresh()
         return sorted(
             self._models.values(),
             key=lambda item: (item.name, item.version),
