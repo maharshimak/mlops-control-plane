@@ -63,6 +63,10 @@ class ModelRegistry:
                 "CREATE INDEX IF NOT EXISTS idx_lifecycle_model "
                 "ON lifecycle_events(model_key, id)"
             )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_production_per_model "
+                "ON model_versions(name) WHERE stage = 'production'"
+            )
             connection.commit()
 
     def _load(self) -> None:
@@ -232,25 +236,77 @@ class ModelRegistry:
         if not evaluate_promotion(model).allowed:
             raise ValueError("Current evaluations no longer satisfy promotion policy.")
 
-        changed: list[tuple[ModelVersion, str, str]] = []
+        changes: list[tuple[ModelVersion, str, str, str]] = []
         for other in self._models.values():
             if other.name == name and other.stage == "production":
-                previous = other.stage
-                validate_transition(previous, "archived")
-                other.stage = "archived"
-                changed.append((other, previous, "replaced by newer production version"))
+                validate_transition(other.stage, "archived")
+                changes.append(
+                    (
+                        other,
+                        other.stage,
+                        "archived",
+                        "replaced by newer production version",
+                    )
+                )
 
-        previous = model.stage
-        model.stage = "production"
-        changed.append((model, previous, "candidate promoted to production"))
-        for item, from_stage, reason in changed:
-            self._persist(item)
-            self._record_transition(
-                item,
+        changes.append(
+            (
+                model,
+                model.stage,
+                "production",
+                "candidate promoted to production",
+            )
+        )
+        events = [
+            LifecycleEvent(
+                model_key=item.key,
                 from_stage=from_stage,
-                to_stage=item.stage,
+                to_stage=to_stage,
                 reason=reason,
             )
+            for item, from_stage, to_stage, reason in changes
+        ]
+
+        if self.database_path is not None:
+            # Promotion, archival and audit events must commit as one unit. This
+            # prevents crashes/concurrent writers from leaving no production
+            # model or two production rows.
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for item, from_stage, to_stage, _ in changes:
+                    cursor = connection.execute(
+                        """
+                        UPDATE model_versions
+                        SET stage = ?
+                        WHERE model_key = ? AND stage = ?
+                        """,
+                        (to_stage, item.key, from_stage),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError(
+                            f"Concurrent lifecycle update detected for {item.key}."
+                        )
+                for event in events:
+                    connection.execute(
+                        """
+                        INSERT INTO lifecycle_events(
+                            model_key, from_stage, to_stage, reason, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event.model_key,
+                            event.from_stage,
+                            event.to_stage,
+                            event.reason,
+                            event.created_at,
+                        ),
+                    )
+                connection.commit()
+
+        for item, _, to_stage, _ in changes:
+            item.stage = to_stage
+        self._events.extend(events)
 
     def list(self) -> list[ModelVersion]:
         return sorted(
