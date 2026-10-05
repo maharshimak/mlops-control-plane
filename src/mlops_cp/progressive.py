@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 
 from mlops_cp.canary import CanaryDecision, CanarySnapshot, evaluate_canary
 from mlops_cp.governance import metric_regressions
@@ -17,14 +18,28 @@ class RolloutPolicy:
     max_quality_drop: float = 0.02
 
     def __post_init__(self) -> None:
-        if not self.stages or self.stages[-1] != 100:
+        if not self.stages or any(type(stage) is not int for stage in self.stages):
+            raise ValueError("rollout stages must be integer percentages")
+        if self.stages[-1] != 100:
             raise ValueError("rollout stages must end at 100 percent")
         if tuple(sorted(set(self.stages))) != self.stages:
             raise ValueError("rollout stages must be unique and strictly increasing")
         if self.stages[0] < 1 or any(stage > 100 for stage in self.stages):
             raise ValueError("rollout stages must be between 1 and 100")
-        if self.min_requests_per_stage < 1:
-            raise ValueError("min_requests_per_stage must be positive")
+        if type(self.min_requests_per_stage) is not int or self.min_requests_per_stage < 1:
+            raise ValueError("min_requests_per_stage must be a positive integer")
+        for value in (
+            self.max_error_rate_increase,
+            self.max_latency_increase_ms,
+            self.max_quality_drop,
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not isfinite(value)
+                or value < 0
+            ):
+                raise ValueError("rollout regression budgets must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)
