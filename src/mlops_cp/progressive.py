@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mlops_cp.canary import CanaryDecision, CanarySnapshot, evaluate_canary
+from mlops_cp.governance import metric_regressions
+from mlops_cp.models import ModelVersion
+from mlops_cp.policy import evaluate_promotion
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,4 +80,44 @@ def evaluate_progressive_rollout(
         current_traffic_percent,
         next_stage,
         (),
+    )
+
+
+def evaluate_governed_rollout(
+    production_snapshot: CanarySnapshot,
+    candidate_snapshot: CanarySnapshot,
+    current_traffic_percent: int,
+    *,
+    baseline_model: ModelVersion,
+    candidate_model: ModelVersion,
+    policy: RolloutPolicy | None = None,
+    regression_tolerance: float = 0.0,
+) -> RolloutDecision:
+    """Combine offline model governance with live canary evidence."""
+    promotion = evaluate_promotion(candidate_model)
+    reasons: list[str] = []
+    if not promotion.allowed:
+        reasons.extend(f"promotion policy: {reason}" for reason in promotion.reasons)
+
+    regressions = metric_regressions(
+        baseline_model,
+        candidate_model,
+        tolerance=regression_tolerance,
+    )
+    reasons.extend(f"offline regression: {item.metric}" for item in regressions)
+
+    if reasons:
+        action = "rollback" if current_traffic_percent > 0 else "hold"
+        return RolloutDecision(
+            action=action,
+            current_traffic_percent=current_traffic_percent,
+            next_traffic_percent=0 if action == "rollback" else current_traffic_percent,
+            reasons=tuple(reasons),
+        )
+
+    return evaluate_progressive_rollout(
+        production_snapshot,
+        candidate_snapshot,
+        current_traffic_percent,
+        policy=policy,
     )
