@@ -1,3 +1,7 @@
+import math
+
+import pytest
+
 from mlops_cp.canary import CanarySnapshot
 from mlops_cp.models import Evaluation, ModelVersion
 from mlops_cp.progressive import (
@@ -31,6 +35,24 @@ def test_progressive_rollout_rolls_back_on_quality_regression():
     )
     assert decision.action == "rollback"
     assert decision.next_traffic_percent == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"stages": (True, 100)},
+        {"stages": (1.0, 100)},
+        {"min_requests_per_stage": True},
+        {"min_requests_per_stage": 0},
+        {"max_error_rate_increase": math.inf},
+        {"max_latency_increase_ms": math.nan},
+        {"max_quality_drop": -0.01},
+        {"max_quality_drop": True},
+    ],
+)
+def test_rollout_policy_rejects_invalid_runtime_controls(kwargs):
+    with pytest.raises(ValueError):
+        RolloutPolicy(**kwargs)
 
 
 def model(version: str, accuracy: float, latency: float, stage: str) -> ModelVersion:
