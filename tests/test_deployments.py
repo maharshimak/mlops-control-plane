@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from mlops_cp.deployments import DeploymentCommand, HTTPDeploymentTarget, command_for_rollout
@@ -29,6 +31,17 @@ def test_remote_deployment_target_requires_https():
     with pytest.raises(ValueError, match="HTTPS"):
         HTTPDeploymentTarget("http://example.com/deploy")
     assert HTTPDeploymentTarget("http://localhost:9000/deploy").endpoint.startswith("http://")
+
+
+@pytest.mark.parametrize("timeout", [0, -1, math.inf, math.nan, True])
+def test_deployment_target_rejects_invalid_timeout(timeout):
+    with pytest.raises(ValueError, match="finite and positive"):
+        HTTPDeploymentTarget("https://deploy.example.com/command", timeout_seconds=timeout)
+
+
+def test_deployment_target_rejects_embedded_credentials():
+    with pytest.raises(ValueError, match="must not embed credentials"):
+        HTTPDeploymentTarget("https://user:secret@deploy.example.com/command")
 
 
 def test_rollout_decision_translates_to_narrow_traffic_command():
