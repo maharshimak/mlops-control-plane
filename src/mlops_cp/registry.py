@@ -99,40 +99,61 @@ class ModelRegistry:
         if self.database_path is not None:
             self._load()
 
-    def _persist(self, model: ModelVersion) -> None:
-        if self.database_path is None:
-            return
-        payload = json.dumps(
+    @staticmethod
+    def _evaluation_payload(model: ModelVersion) -> str:
+        return json.dumps(
             [asdict(evaluation) for evaluation in model.evaluations],
             sort_keys=True,
             separators=(",", ":"),
         )
+
+    @staticmethod
+    def _insert_event(
+        connection: sqlite3.Connection,
+        event: LifecycleEvent,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO lifecycle_events(
+                model_key, from_stage, to_stage, reason, created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                event.model_key,
+                event.from_stage,
+                event.to_stage,
+                event.reason,
+                event.created_at,
+            ),
+        )
+
+    def _persist(self, model: ModelVersion) -> None:
+        if self.database_path is None:
+            return
+        payload = self._evaluation_payload(model)
         with closing(self._connect()) as connection, connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
-                INSERT INTO model_versions(
-                    model_key, name, version, artifact_uri, dataset_fingerprint,
-                    stage, evaluations_json, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(model_key) DO UPDATE SET
-                    artifact_uri = excluded.artifact_uri,
-                    dataset_fingerprint = excluded.dataset_fingerprint,
-                    stage = excluded.stage,
-                    evaluations_json = excluded.evaluations_json,
-                    created_at = excluded.created_at
+                UPDATE model_versions
+                SET artifact_uri = ?,
+                    dataset_fingerprint = ?,
+                    stage = ?,
+                    evaluations_json = ?,
+                    created_at = ?
+                WHERE model_key = ?
                 """,
                 (
-                    model.key,
-                    model.name,
-                    model.version,
                     model.artifact_uri,
                     model.dataset_fingerprint,
                     model.stage,
                     payload,
                     model.created_at,
+                    model.key,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Model disappeared during persistence: {model.key}.")
 
     def _record_transition(
         self,
@@ -152,21 +173,7 @@ class ModelRegistry:
         if self.database_path is None:
             return
         with closing(self._connect()) as connection, connection:
-            connection.execute(
-                """
-                INSERT INTO lifecycle_events(
-                    model_key, from_stage, to_stage, reason, created_at
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    event.model_key,
-                    event.from_stage,
-                    event.to_stage,
-                    event.reason,
-                    event.created_at,
-                ),
-            )
+            self._insert_event(connection, event)
 
     def history(self, name: str, version: str) -> list[LifecycleEvent]:
         model_key = f"{name}:{version}"
@@ -190,14 +197,53 @@ class ModelRegistry:
             raise ValueError(f"Model version already exists: {model.key}")
         if model.stage != "registered":
             raise ValueError("New models must enter in the registered stage.")
-        self._models[model.key] = model
-        self._persist(model)
-        self._record_transition(
-            model,
+
+        event = LifecycleEvent(
+            model_key=model.key,
             from_stage=None,
             to_stage="registered",
             reason="model registered",
         )
+
+        if self.database_path is not None:
+            payload = self._evaluation_payload(model)
+            with closing(self._connect()) as connection:
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    try:
+                        connection.execute(
+                            """
+                            INSERT INTO model_versions(
+                                model_key, name, version, artifact_uri, dataset_fingerprint,
+                                stage, evaluations_json, created_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                model.key,
+                                model.name,
+                                model.version,
+                                model.artifact_uri,
+                                model.dataset_fingerprint,
+                                model.stage,
+                                payload,
+                                model.created_at,
+                            ),
+                        )
+                    except sqlite3.IntegrityError as error:
+                        connection.rollback()
+                        raise ValueError(
+                            f"Model version already exists: {model.key}"
+                        ) from error
+                    self._insert_event(connection, event)
+                    connection.commit()
+                except Exception:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    raise
+
+        self._models[model.key] = model
+        self._events.append(event)
         return model
 
     def get(self, name: str, version: str) -> ModelVersion:
@@ -222,18 +268,43 @@ class ModelRegistry:
     ) -> PromotionDecision:
         model = self.get(name, version)
         decision = evaluate_promotion(model)
-        if decision.allowed:
-            previous = model.stage
-            validate_transition(previous, "candidate")
-            model.stage = "candidate"
-            self._persist(model)
-            if previous != "candidate":
-                self._record_transition(
-                    model,
-                    from_stage=previous,
-                    to_stage="candidate",
-                    reason="promotion policy satisfied",
-                )
+        if not decision.allowed:
+            return decision
+
+        previous = model.stage
+        validate_transition(previous, "candidate")
+        event = LifecycleEvent(
+            model_key=model.key,
+            from_stage=previous,
+            to_stage="candidate",
+            reason="promotion policy satisfied",
+        )
+
+        if self.database_path is not None:
+            with closing(self._connect()) as connection:
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    cursor = connection.execute(
+                        """
+                        UPDATE model_versions
+                        SET stage = ?
+                        WHERE model_key = ? AND stage = ?
+                        """,
+                        ("candidate", model.key, previous),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError(
+                            f"Concurrent lifecycle update detected for {model.key}."
+                        )
+                    self._insert_event(connection, event)
+                    connection.commit()
+                except Exception:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    raise
+
+        model.stage = "candidate"
+        self._events.append(event)
         return decision
 
     def promote_production(self, name: str, version: str) -> None:
@@ -278,37 +349,28 @@ class ModelRegistry:
             # prevents crashes/concurrent writers from leaving no production
             # model or two production rows.
             with closing(self._connect()) as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                for item, from_stage, to_stage, _ in changes:
-                    cursor = connection.execute(
-                        """
-                        UPDATE model_versions
-                        SET stage = ?
-                        WHERE model_key = ? AND stage = ?
-                        """,
-                        (to_stage, item.key, from_stage),
-                    )
-                    if cursor.rowcount != 1:
-                        raise RuntimeError(
-                            f"Concurrent lifecycle update detected for {item.key}."
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    for item, from_stage, to_stage, _ in changes:
+                        cursor = connection.execute(
+                            """
+                            UPDATE model_versions
+                            SET stage = ?
+                            WHERE model_key = ? AND stage = ?
+                            """,
+                            (to_stage, item.key, from_stage),
                         )
-                for event in events:
-                    connection.execute(
-                        """
-                        INSERT INTO lifecycle_events(
-                            model_key, from_stage, to_stage, reason, created_at
-                        )
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (
-                            event.model_key,
-                            event.from_stage,
-                            event.to_stage,
-                            event.reason,
-                            event.created_at,
-                        ),
-                    )
-                connection.commit()
+                        if cursor.rowcount != 1:
+                            raise RuntimeError(
+                                f"Concurrent lifecycle update detected for {item.key}."
+                            )
+                    for event in events:
+                        self._insert_event(connection, event)
+                    connection.commit()
+                except Exception:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    raise
 
         for item, _, to_stage, _ in changes:
             item.stage = to_stage
