@@ -40,7 +40,7 @@ A compact model lifecycle control plane for **registration, quality gates, promo
 - Population Stability Index (PSI)
 - drift severity classification
 - durable SQLite-backed model registry for API lifecycle state, plus standalone JSONL utilities
-- immutable persisted lifecycle transition history for registration, candidate promotion, production promotion and archival
+- immutable persisted lifecycle transition history for registration, candidate promotion, production promotion and archival\n- transactional registration/candidate transitions so lifecycle state and history cannot partially commit
 - FastAPI service
 - tests
 - Docker
@@ -119,7 +119,7 @@ if decision.allowed:
 
 ## Scope and limitations
 
-The API registry is SQLite-backed by default and persists model versions, evaluations, current stages and immutable lifecycle transition events across restart. JSONL state, lineage and canary helpers remain separate utilities rather than deployment integrations. Artifact URIs are metadata; artifacts are not uploaded or cryptographically verified. Registered models enter through gates, but library callers receive mutable model objects and are trusted. Thresholds are supplied by callers rather than an independent governance authority. No authentication, external rollout controller or automated infrastructure rollback is implemented.
+The API registry is SQLite-backed by default and persists model versions, evaluations, current stages and immutable lifecycle transition events across restart. Registration, candidate promotion and production promotion commit lifecycle state together with their audit history; candidate promotion also uses a compare-and-set update to detect conflicting stage changes. Evaluation appends remain a local read/modify/write path rather than a distributed multi-writer protocol. Artifact URIs are metadata; artifacts are not uploaded or cryptographically verified. Library callers receive mutable model objects and are trusted. Thresholds are supplied by callers rather than an independent governance authority. Remote API access can be bearer-authenticated, and an explicit HTTPS deployment target exists, but automated cloud rollback, signed artifacts and independent approvals are not implemented.
 
 ## Installation and development
 
@@ -180,7 +180,7 @@ docker run --rm -p 127.0.0.1:8000:8000 mlops-control-plane
 
 ## Next engineering work
 
-Transactional multi-writer persistence; independent policy configuration; artifact checksums/signatures; authenticated approvals; real deployment adapters. These are planned work, not current capabilities.
+Conflict-safe multi-writer evaluation persistence; independent policy configuration; artifact checksums/signatures; authenticated approvals; idempotent deployment receipts and production-grade controller adapters. These are planned work, not current capabilities.
 
 ## Contributing and security
 
