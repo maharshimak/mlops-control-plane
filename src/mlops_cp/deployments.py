@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from typing import Protocol
 from urllib import parse, request
 
+from mlops_cp.models import ModelVersion
+from mlops_cp.progressive import RolloutDecision
+
 
 @dataclass(frozen=True, slots=True)
 class DeploymentCommand:
@@ -81,3 +84,32 @@ class HTTPDeploymentTarget:
             ),
             detail=str(body.get("detail", "")),
         )
+
+
+def command_for_rollout(
+    model: ModelVersion,
+    decision: RolloutDecision,
+) -> DeploymentCommand | None:
+    """Translate an evaluated rollout decision into a narrow deployment command."""
+    if model.stage not in {"candidate", "production"}:
+        raise ValueError("Only candidate or production models can receive rollout traffic.")
+
+    if decision.action in {"hold", "complete"}:
+        return None
+    if decision.action == "rollback":
+        return DeploymentCommand(
+            model_key=model.key,
+            artifact_uri=model.artifact_uri,
+            action="rollback",
+            traffic_percent=0,
+            reason="; ".join(decision.reasons) or "rollout policy requested rollback",
+        )
+    if decision.action in {"increase", "promote"}:
+        return DeploymentCommand(
+            model_key=model.key,
+            artifact_uri=model.artifact_uri,
+            action="set_traffic",
+            traffic_percent=decision.next_traffic_percent,
+            reason="progressive rollout policy satisfied",
+        )
+    raise ValueError(f"Unsupported rollout decision action: {decision.action}")
