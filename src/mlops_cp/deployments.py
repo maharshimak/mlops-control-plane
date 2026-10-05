@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from math import isfinite
 from typing import Protocol
 from urllib import parse, request
 
@@ -58,8 +59,15 @@ class HTTPDeploymentTarget:
             raise ValueError("deployment endpoint must use HTTPS except on localhost.")
         if not parsed.hostname:
             raise ValueError("deployment endpoint requires a hostname.")
-        if self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive.")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("deployment endpoint must not embed credentials.")
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or not isfinite(self.timeout_seconds)
+            or self.timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be finite and positive.")
 
     def execute(self, command: DeploymentCommand) -> DeploymentReceipt:
         payload = json.dumps(
