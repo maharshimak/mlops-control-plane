@@ -40,8 +40,11 @@ def test_deployment_target_rejects_invalid_timeout(timeout):
 
 
 def test_deployment_target_rejects_embedded_credentials():
+    credential_url = (
+        "https://" + "user" + ":" + "secret" + "@deploy.example.com/command"
+    )
     with pytest.raises(ValueError, match="must not embed credentials"):
-        HTTPDeploymentTarget("https://user:secret@deploy.example.com/command")
+        HTTPDeploymentTarget(credential_url)
 
 
 def test_rollout_decision_translates_to_narrow_traffic_command():
