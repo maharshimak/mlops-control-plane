@@ -190,8 +190,9 @@ class ModelRegistry:
             raise ValueError(f"Model version already exists: {model.key}")
         if model.stage != "registered":
             raise ValueError("New models must enter in the registered stage.")
-        self._models[model.key] = model
+        # Never advertise an in-memory registration until persistence succeeds.
         self._persist(model)
+        self._models[model.key] = model
         self._record_transition(
             model,
             from_stage=None,
