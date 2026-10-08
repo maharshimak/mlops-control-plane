@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from mlops_cp.lifecycle import validate_transition
@@ -212,9 +212,12 @@ class ModelRegistry:
         evaluation: Evaluation,
     ) -> ModelVersion:
         model = self.get(name, version)
-        model.evaluations.append(evaluation)
-        self._persist(model)
-        return model
+        # Stage a new value rather than mutating the shared object before an
+        # I/O operation that can fail.
+        updated = replace(model, evaluations=[*model.evaluations, evaluation])
+        self._persist(updated)
+        self._models[updated.key] = updated
+        return updated
 
     def promote_candidate(
         self,
