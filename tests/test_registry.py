@@ -50,3 +50,23 @@ def test_failed_metric_blocks_candidate() -> None:
         ),
     )
     assert not registry.promote_candidate("risk", "2").allowed
+
+
+def test_failed_registration_does_not_change_in_memory_registry(monkeypatch):
+    import pytest
+
+    registry = ModelRegistry()
+    model = ModelVersion(
+        name="unavailable",
+        version="1",
+        artifact_uri="model://unavailable/1",
+        dataset_fingerprint="abc",
+    )
+
+    def fail_to_persist(model):
+        raise OSError("simulated storage failure")
+
+    monkeypatch.setattr(registry, "_persist", fail_to_persist)
+    with pytest.raises(OSError, match="storage failure"):
+        registry.register(model)
+    assert registry.list() == []
