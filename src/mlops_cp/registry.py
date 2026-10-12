@@ -168,6 +168,52 @@ class ModelRegistry:
                 ),
             )
 
+    def _append_evaluation_durably(
+        self, model_key: str, evaluation: Evaluation
+    ) -> ModelVersion:
+        """Serialize evaluation appends against concurrent writers.
+
+        BEGIN IMMEDIATE protects the read/append/write transaction; updating only
+        the evaluation column prevents a stale worker from reverting the stage.
+        """
+        if self.database_path is None:
+            raise RuntimeError("Registry persistence is not configured.")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT name, version, artifact_uri, dataset_fingerprint,
+                       stage, evaluations_json, created_at
+                FROM model_versions WHERE model_key = ?
+                """,
+                (model_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown model version: {model_key}")
+            evaluations = [
+                Evaluation(**entry) for entry in json.loads(row["evaluations_json"])
+            ]
+            updated = ModelVersion(
+                name=row["name"],
+                version=row["version"],
+                artifact_uri=row["artifact_uri"],
+                dataset_fingerprint=row["dataset_fingerprint"],
+                stage=row["stage"],
+                evaluations=[*evaluations, evaluation],
+                created_at=row["created_at"],
+            )
+            serialized = json.dumps(
+                [asdict(entry) for entry in updated.evaluations],
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            connection.execute(
+                "UPDATE model_versions SET evaluations_json = ? WHERE model_key = ?",
+                (serialized, model_key),
+            )
+            connection.commit()
+        return updated
+
     def _persist_registration_with_event(
         self, model: ModelVersion, event: LifecycleEvent
     ) -> None:
@@ -290,10 +336,13 @@ class ModelRegistry:
         evaluation: Evaluation,
     ) -> ModelVersion:
         model = self.get(name, version)
-        # Stage a new value rather than mutating the shared object before an
-        # I/O operation that can fail.
-        updated = replace(model, evaluations=[*model.evaluations, evaluation])
-        self._persist(updated)
+        if self.database_path is None:
+            # Preserve the in-memory persistence hook used by test doubles.
+            updated = replace(model, evaluations=[*model.evaluations, evaluation])
+            self._persist(updated)
+        else:
+            # Refresh evaluation data *inside* a write transaction, not before it.
+            updated = self._append_evaluation_durably(model.key, evaluation)
         self._models[updated.key] = updated
         return updated
 
