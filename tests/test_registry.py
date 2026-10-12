@@ -101,6 +101,7 @@ def test_failed_evaluation_persistence_preserves_previous_state(monkeypatch):
 
 def test_registration_audit_failure_rolls_back_both_writes(tmp_path):
     import sqlite3
+
     import pytest
 
     db = tmp_path / "registry.db"
@@ -125,6 +126,7 @@ def test_registration_audit_failure_rolls_back_both_writes(tmp_path):
 
 def test_candidate_audit_failure_preserves_registered_stage(tmp_path):
     import sqlite3
+
     import pytest
 
     db = tmp_path / "registry.db"
