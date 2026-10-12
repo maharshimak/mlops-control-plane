@@ -169,3 +169,77 @@ def test_duplicate_registration_race_never_overwrites_existing_row(tmp_path):
         ))
     assert first.get("same", "1").artifact_uri == "model://original"
     assert len(first.history("same", "1")) == 1
+
+
+def test_concurrent_evaluation_appends_preserve_all_metrics(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    db = tmp_path / "registry.db"
+    primary = ModelRegistry(str(db))
+    primary.register(ModelVersion(
+        name="fraud", version="1", artifact_uri="model://fraud/1",
+        dataset_fingerprint="data",
+    ))
+    writers = [ModelRegistry(str(db)) for _ in range(8)]
+
+    def record(index):
+        writers[index].add_evaluation(
+            "fraud", "1",
+            Evaluation(metric=f"metric_{index}", value=0.95, threshold=0.80),
+        )
+
+    with ThreadPoolExecutor(max_workers=len(writers)) as pool:
+        list(pool.map(record, range(len(writers))))
+
+    result = primary.get("fraud", "1")
+    assert len(result.evaluations) == len(writers)
+    assert {entry.metric for entry in result.evaluations} == {
+        f"metric_{i}" for i in range(len(writers))
+    }
+
+
+def test_append_after_external_promotion_does_not_revert_stage(tmp_path):
+    db = tmp_path / "registry.db"
+    source = ModelRegistry(str(db))
+    source.register(ModelVersion(
+        name="fraud", version="1", artifact_uri="model://fraud/1",
+        dataset_fingerprint="data",
+    ))
+    stale = ModelRegistry(str(db))
+    source.add_evaluation(
+        "fraud", "1", Evaluation(metric="auc", value=0.95, threshold=0.80),
+    )
+    source.promote_candidate("fraud", "1")
+    source.promote_production("fraud", "1")
+
+    stale.add_evaluation(
+        "fraud", "1", Evaluation(metric="latency", value=10, threshold=15,
+                                 higher_is_better=False),
+    )
+    reloaded = ModelRegistry(str(db))
+    actual = reloaded.get("fraud", "1")
+    assert actual.stage == "production"
+    assert len(actual.evaluations) == 2
+
+
+def test_evaluation_write_rolls_back_on_database_failure(tmp_path):
+    import sqlite3
+
+    import pytest
+
+    db = tmp_path / "registry.db"
+    registry = ModelRegistry(str(db))
+    registry.register(ModelVersion(
+        name="fraud", version="1", artifact_uri="model://fraud/1",
+        dataset_fingerprint="data",
+    ))
+    with sqlite3.connect(db) as connection:
+        connection.execute(
+            "CREATE TRIGGER prevent_evaluation BEFORE UPDATE OF evaluations_json "
+            "ON model_versions BEGIN SELECT RAISE(ABORT, 'evaluation unavailable'); END"
+        )
+    with pytest.raises(sqlite3.DatabaseError, match="evaluation unavailable"):
+        registry.add_evaluation(
+            "fraud", "1", Evaluation(metric="auc", value=0.95, threshold=0.80),
+        )
+    assert registry.get("fraud", "1").evaluations == []
