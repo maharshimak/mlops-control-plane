@@ -296,6 +296,7 @@ def test_candidate_still_promotes_when_snapshot_has_valid_metrics(tmp_path):
 
 def test_production_rechecks_metrics_after_concurrent_append(tmp_path, monkeypatch):
     import pytest
+
     import mlops_cp.registry as registry_module
 
     db = tmp_path / "production-race.sqlite"
