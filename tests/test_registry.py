@@ -374,3 +374,77 @@ def test_production_rejects_stale_archival_plan(tmp_path, monkeypatch):
     assert final.get("risk", "1").stage == "production"
     assert final.get("risk", "2").stage == "candidate"
     assert len(final.history("risk", "2")) == 2
+
+
+def test_concurrent_production_promotion_of_same_model_is_single_writer(tmp_path):
+    """Only one independent worker may record the production transition."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    db = tmp_path / "stress-promotion.sqlite"
+    setup = ModelRegistry(str(db))
+    setup.register(ModelVersion(
+        name="risk", version="v1", artifact_uri="model://risk/v1",
+        dataset_fingerprint="data",
+    ))
+    setup.add_evaluation(
+        "risk", "v1", Evaluation(metric="auc", value=0.98, threshold=0.85),
+    )
+    assert setup.promote_candidate("risk", "v1").allowed
+
+    workers = [ModelRegistry(str(db)) for _ in range(8)]
+    ready = Barrier(len(workers))
+
+    def compete(worker):
+        ready.wait(timeout=10)
+        try:
+            worker.promote_production("risk", "v1")
+            return "promoted"
+        except (ValueError, RuntimeError):
+            return "rejected"
+
+    with ThreadPoolExecutor(max_workers=len(workers)) as pool:
+        outcomes = list(pool.map(compete, workers))
+    assert outcomes.count("promoted") == 1
+    assert outcomes.count("rejected") == 7
+    verify = ModelRegistry(str(db))
+    assert verify.get("risk", "v1").stage == "production"
+    assert [item.to_stage for item in verify.history("risk", "v1")] == [
+        "registered", "candidate", "production",
+    ]
+
+
+def test_failed_promotion_audit_insert_rolls_back_old_and_new_stages(tmp_path):
+    import sqlite3
+
+    import pytest
+
+    db = tmp_path / "rollback-production.sqlite"
+    registry = ModelRegistry(str(db))
+    for version in ("1", "2"):
+        registry.register(ModelVersion(
+            name="quality", version=version,
+            artifact_uri=f"model://quality/{version}", dataset_fingerprint="data",
+        ))
+        registry.add_evaluation(
+            "quality", version,
+            Evaluation(metric="auc", value=0.95, threshold=0.8),
+        )
+        registry.promote_candidate("quality", version)
+    registry.promote_production("quality", "1")
+    with sqlite3.connect(db) as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_new_production_event "
+            "BEFORE INSERT ON lifecycle_events "
+            "WHEN NEW.to_stage = 'production' AND NEW.model_key = 'quality:2' "
+            "BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END"
+        )
+
+    with pytest.raises(sqlite3.DatabaseError, match="audit unavailable"):
+        registry.promote_production("quality", "2")
+    verify = ModelRegistry(str(db))
+    assert verify.get("quality", "1").stage == "production"
+    assert verify.get("quality", "2").stage == "candidate"
+    assert [event.to_stage for event in verify.history("quality", "2")] == [
+        "registered", "candidate",
+    ]
