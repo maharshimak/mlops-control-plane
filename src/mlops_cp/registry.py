@@ -258,17 +258,42 @@ class ModelRegistry:
 
     def _persist_candidate_with_event(
         self, model: ModelVersion, event: LifecycleEvent
-    ) -> None:
-        """CAS lifecycle transition plus durable audit, or no mutation."""
+    ) -> PromotionDecision:
+        """Revalidate the *current* policy under the same write lock as promotion.
+
+        An evaluation may have been appended after promote_candidate() loaded
+        the model. A stage-only CAS would promote a now-disqualified model.
+        """
         if self.database_path is None:
             raise RuntimeError("Registry persistence is not configured.")
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT stage, dataset_fingerprint, evaluations_json "
+                "FROM model_versions WHERE model_key = ?",
+                (model.key,),
+            ).fetchone()
+            if row is None or row["stage"] != event.from_stage:
+                raise RuntimeError(
+                    f"Concurrent lifecycle update detected for {model.key}."
+                )
+            current = replace(
+                model,
+                stage=row["stage"],
+                dataset_fingerprint=row["dataset_fingerprint"],
+                evaluations=[
+                    Evaluation(**entry)
+                    for entry in json.loads(row["evaluations_json"])
+                ],
+            )
+            decision = evaluate_promotion(current)
+            if not decision.allowed:
+                connection.rollback()
+                return decision
+
             result = connection.execute(
-                """
-                UPDATE model_versions SET stage = 'candidate'
-                WHERE model_key = ? AND stage = ?
-                """,
+                "UPDATE model_versions SET stage = 'candidate' "
+                "WHERE model_key = ? AND stage = ?",
                 (model.key, event.from_stage),
             )
             if result.rowcount != 1:
@@ -287,6 +312,7 @@ class ModelRegistry:
                 ),
             )
             connection.commit()
+        return decision
 
     def history(self, name: str, version: str) -> list[LifecycleEvent]:
         model_key = f"{name}:{version}"
@@ -368,7 +394,10 @@ class ModelRegistry:
                     # before its persistence hook reports success.
                     self._persist(replace(model, stage="candidate"))
                 else:
-                    self._persist_candidate_with_event(model, event)
+                    decision = self._persist_candidate_with_event(model, event)
+                    if not decision.allowed:
+                        self._refresh()
+                        return decision
                 model.stage = "candidate"
                 self._events.append(event)
         return decision
