@@ -243,3 +243,52 @@ def test_evaluation_write_rolls_back_on_database_failure(tmp_path):
             "fraud", "1", Evaluation(metric="auc", value=0.95, threshold=0.80),
         )
     assert registry.get("fraud", "1").evaluations == []
+
+
+def test_candidate_rechecks_latest_metrics_inside_write_transaction(tmp_path, monkeypatch):
+    """A disqualifying evaluation arriving after the initial read must block promotion."""
+    db = tmp_path / "racing-promotions.sqlite"
+    first = ModelRegistry(str(db))
+    second = ModelRegistry(str(db))
+    first.register(ModelVersion(
+        name="risk", version="1", artifact_uri="model://risk/1",
+        dataset_fingerprint="dataset",
+    ))
+    first.add_evaluation(
+        "risk", "1", Evaluation(metric="auc", value=0.96, threshold=0.80),
+    )
+    persist = first._persist_candidate_with_event
+
+    def append_before_lock(model, event):
+        second.add_evaluation(
+            "risk", "1",
+            Evaluation(metric="mae", value=5.0, threshold=2.0,
+                       higher_is_better=False),
+        )
+        return persist(model, event)
+
+    monkeypatch.setattr(first, "_persist_candidate_with_event", append_before_lock)
+    decision = first.promote_candidate("risk", "1")
+    assert not decision.allowed
+    assert any("mae" in reason for reason in decision.reasons)
+    fresh = ModelRegistry(str(db))
+    assert fresh.get("risk", "1").stage == "registered"
+    assert len(fresh.get("risk", "1").evaluations) == 2
+    assert [event.to_stage for event in fresh.history("risk", "1")] == ["registered"]
+
+
+def test_candidate_still_promotes_when_snapshot_has_valid_metrics(tmp_path):
+    db = tmp_path / "valid-promotion.sqlite"
+    registry = ModelRegistry(str(db))
+    registry.register(ModelVersion(
+        name="quality", version="1", artifact_uri="model://quality/1",
+        dataset_fingerprint="dataset",
+    ))
+    registry.add_evaluation(
+        "quality", "1", Evaluation(metric="auc", value=0.94, threshold=0.80),
+    )
+    assert registry.promote_candidate("quality", "1").allowed
+    assert registry.get("quality", "1").stage == "candidate"
+    assert [event.to_stage for event in registry.history("quality", "1")] == [
+        "registered", "candidate",
+    ]
