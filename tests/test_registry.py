@@ -292,3 +292,85 @@ def test_candidate_still_promotes_when_snapshot_has_valid_metrics(tmp_path):
     assert [event.to_stage for event in registry.history("quality", "1")] == [
         "registered", "candidate",
     ]
+
+
+def test_production_rechecks_metrics_after_concurrent_append(tmp_path, monkeypatch):
+    import pytest
+
+    import mlops_cp.registry as registry_module
+
+    db = tmp_path / "production-race.sqlite"
+    candidate = ModelRegistry(str(db))
+    external = ModelRegistry(str(db))
+    candidate.register(ModelVersion(
+        name="quality", version="1", artifact_uri="model://quality",
+        dataset_fingerprint="dataset",
+    ))
+    candidate.add_evaluation(
+        "quality", "1", Evaluation(metric="auc", value=0.96, threshold=0.8),
+    )
+    assert candidate.promote_candidate("quality", "1").allowed
+
+    evaluate = registry_module.evaluate_promotion
+    injected = False
+
+    def add_failing_evaluation_once(model, *args, **kwargs):
+        nonlocal injected
+        decision = evaluate(model, *args, **kwargs)
+        if not injected and model.stage == "candidate":
+            injected = True
+            external.add_evaluation(
+                "quality", "1",
+                Evaluation(metric="mae", value=20, threshold=2, higher_is_better=False),
+            )
+        return decision
+
+    monkeypatch.setattr(registry_module, "evaluate_promotion", add_failing_evaluation_once)
+    with pytest.raises(ValueError, match="Current evaluations"):
+        candidate.promote_production("quality", "1")
+    fresh = ModelRegistry(str(db))
+    assert fresh.get("quality", "1").stage == "candidate"
+    assert len(fresh.get("quality", "1").evaluations) == 2
+    assert [event.to_stage for event in fresh.history("quality", "1")] == [
+        "registered", "candidate",
+    ]
+
+
+def test_production_rejects_stale_archival_plan(tmp_path, monkeypatch):
+    import pytest
+
+    import mlops_cp.registry as registry_module
+
+    db = tmp_path / "competing-promotion.sqlite"
+    first = ModelRegistry(str(db))
+    other = ModelRegistry(str(db))
+    for version in ("1", "2"):
+        first.register(ModelVersion(
+            name="risk", version=version, artifact_uri=f"model://risk/{version}",
+            dataset_fingerprint="dataset",
+        ))
+        first.add_evaluation(
+            "risk", version, Evaluation(metric="auc", value=0.96, threshold=0.8),
+        )
+        first.promote_candidate("risk", version)
+
+    # The first promotion completes in a different process only after the
+    # competitor has read the list of existing production models.
+    evaluate = registry_module.evaluate_promotion
+    injected = False
+
+    def competing_promotion(model, *args, **kwargs):
+        nonlocal injected
+        decision = evaluate(model, *args, **kwargs)
+        if model.name == "risk" and model.version == "2" and not injected:
+            injected = True
+            other.promote_production("risk", "1")
+        return decision
+
+    monkeypatch.setattr(registry_module, "evaluate_promotion", competing_promotion)
+    with pytest.raises(RuntimeError, match="Concurrent production promotion"):
+        first.promote_production("risk", "2")
+    final = ModelRegistry(str(db))
+    assert final.get("risk", "1").stage == "production"
+    assert final.get("risk", "2").stage == "candidate"
+    assert len(final.history("risk", "2")) == 2

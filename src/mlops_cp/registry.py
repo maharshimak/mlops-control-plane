@@ -445,6 +445,49 @@ class ModelRegistry:
             # model or two production rows.
             with closing(self._connect()) as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                # Re-read quality evidence while holding the SQLite writer lock.
+                # A second worker may append a failing evaluation after the
+                # initial policy check but before this promotion transaction.
+                current = connection.execute(
+                    "SELECT stage, dataset_fingerprint, evaluations_json "
+                    "FROM model_versions WHERE model_key = ?",
+                    (model.key,),
+                ).fetchone()
+                if current is None or current["stage"] != model.stage:
+                    raise RuntimeError(
+                        f"Concurrent lifecycle update detected for {model.key}."
+                    )
+                latest_model = replace(
+                    model,
+                    stage=current["stage"],
+                    dataset_fingerprint=current["dataset_fingerprint"],
+                    evaluations=[
+                        Evaluation(**item)
+                        for item in json.loads(current["evaluations_json"])
+                    ],
+                )
+                if not evaluate_promotion(latest_model).allowed:
+                    raise ValueError(
+                        "Current evaluations no longer satisfy promotion policy."
+                    )
+                # A competing production promotion might have changed which
+                # version must be archived. Replan instead of archiving a stale
+                # list or violating the single-production unique constraint.
+                active_production = {
+                    row["model_key"]
+                    for row in connection.execute(
+                        "SELECT model_key FROM model_versions "
+                        "WHERE name = ? AND stage = 'production'", (name,)
+                    ).fetchall()
+                }
+                planned_archive = {
+                    item.key for item, from_stage, to_stage, _ in changes
+                    if from_stage == "production" and to_stage == "archived"
+                }
+                if active_production != planned_archive:
+                    raise RuntimeError(
+                        "Concurrent production promotion detected; retry."
+                    )
                 for item, from_stage, to_stage, _ in changes:
                     cursor = connection.execute(
                         """
