@@ -338,6 +338,7 @@ def test_production_rechecks_metrics_after_concurrent_append(tmp_path, monkeypat
 
 def test_production_rejects_stale_archival_plan(tmp_path, monkeypatch):
     import pytest
+
     import mlops_cp.registry as registry_module
 
     db = tmp_path / "competing-promotion.sqlite"
