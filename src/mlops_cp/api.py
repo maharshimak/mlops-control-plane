@@ -2,11 +2,21 @@ import math
 import os
 import secrets
 from dataclasses import asdict
+from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 
-from mlops_cp.models import Evaluation, ModelVersion
+from mlops_cp.contracts import capabilities, policy_from_env, run_operation
+from mlops_cp.governed import GovernanceError, GovernanceService
+from mlops_cp.lifecycle import InvalidLifecycleTransition
+from mlops_cp.models import (
+    MODEL_NAME_PATTERN,
+    MODEL_VERSION_PATTERN,
+    Evaluation,
+    ModelVersion,
+)
 from mlops_cp.registry import ModelRegistry
 
 app = FastAPI(
@@ -17,16 +27,30 @@ app = FastAPI(
         "bearer-protected remote mutation."
     ),
 )
-registry = ModelRegistry(os.environ.get("MLOPS_CP_DB_PATH", "./data/control-plane.db"))
+_db_path = os.environ.get("MLOPS_CP_DB_PATH", "./data/control-plane.db")
+registry = ModelRegistry(_db_path)
+governance = GovernanceService(
+    registry,
+    database_path=None if _db_path == ":memory:" else _db_path,
+    policy=policy_from_env(),
+    artifact_root=os.environ.get("MLOPS_CP_ARTIFACT_ROOT") or None,
+)
 
 
 class RegisterRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1, max_length=200)
-    version: str = Field(min_length=1, max_length=100)
+    name: str = Field(pattern=MODEL_NAME_PATTERN)
+    version: str = Field(pattern=MODEL_VERSION_PATTERN)
     artifact_uri: str = Field(min_length=1, max_length=2000)
     dataset_fingerprint: str = Field(min_length=1, max_length=500)
+
+
+class ApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approver: str = Field(min_length=1, max_length=200)
+    note: str = Field(default="", max_length=2000)
 
 
 class EvaluationRequest(BaseModel):
@@ -142,6 +166,8 @@ def promote_candidate(name: str, version: str) -> dict[str, object]:
         return asdict(decision)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="model not found") from error
+    except InvalidLifecycleTransition as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @app.post("/v1/models/{name}/{version}/production", dependencies=protected)
@@ -153,3 +179,43 @@ def promote_production(name: str, version: str) -> dict[str, str]:
         raise HTTPException(status_code=404, detail="model not found") from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.post("/v1/governance/{name}/{version}/approvals", dependencies=protected)
+def record_approval(name: str, version: str, request: ApprovalRequest) -> dict[str, object]:
+    """Record a named approval. The approver name is asserted by the caller."""
+    try:
+        approval = governance.record_approval(name, version, request.approver, request.note)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="model not found") from error
+    except GovernanceError as error:
+        code = 409 if error.code == "CONFLICT" else 400
+        raise HTTPException(status_code=code, detail=str(error)) from error
+    return asdict(approval)
+
+
+@app.get("/v1/capabilities", dependencies=protected)
+def contract_capabilities() -> dict[str, object]:
+    return capabilities()
+
+
+@app.post("/v1/ops/{operation}", dependencies=protected)
+async def contract_operation(
+    operation: str,
+    request: Request,
+    x_run_id: str | None = Header(default=None),
+    x_correlation_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """makma.v1 envelope; HTTP 200 for every envelope, including error statuses."""
+    try:
+        payload = await request.json() if await request.body() else {}
+    except ValueError:
+        payload = None  # run_operation reports INVALID_INPUT
+    return await run_in_threadpool(
+        run_operation,
+        operation,
+        payload,
+        run_id=x_run_id,
+        correlation_id=x_correlation_id,
+        service=governance,
+    )

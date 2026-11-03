@@ -1,0 +1,23 @@
+{
+  "artifact_sha256": "e270f4284b2745ac61291c1281bd4acd3c764c053df5e19b9338c50c72f4ae6e",
+  "code_version": "95dc79c58011b7db102b7b548baafa8f264059c9",
+  "config_sha256": "27db46d2a4707547b10b0bc49d884d789ddaa3eb9b72e06a1079a160b71ca52f",
+  "dataset_sha256": "8ac99a506ebf38c1bb21884750b396e3bb7cb5b702d65966a702ed0e3e3540ca",
+  "format": "mlops-candidate-evaluation.v1",
+  "gate": {
+    "allowed": false,
+    "reasons": [
+      "psi[x1] 0.111182 > maximum 0.000000"
+    ]
+  },
+  "metrics": {
+    "max_feature_psi": 0.11118152088371436,
+    "test_mae": 3.54263876900518e-09,
+    "test_max_abs_error": 6.717013611989842e-09,
+    "test_rmse": 4.132282517373706e-09,
+    "test_rows_with_train_feature_match": 0.0,
+    "train_mae": 3.3083510597720077e-09
+  },
+  "model_id": "fraud-ridge-e270f4284b2745ac",
+  "run_record_sha256": "4ed3c3bc73ed3ccc47ceb4af9c98a7276d613eaf98e6b894e1ed4e582aa85400"
+}

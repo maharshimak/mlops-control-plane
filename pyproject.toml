@@ -10,13 +10,16 @@ license = "MIT"
 license-files = ["LICENSE"]
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["fastapi>=0.141.1,<1","uvicorn[standard]>=0.52.4,<1"]
+dependencies = ["fastapi>=0.141.1,<1","uvicorn[standard]>=0.52.4,<1","jsonschema>=4.23,<5"]
 
 [project.optional-dependencies]
 dev = ["pytest>=9.1.1,<10","httpx>=0.28.1,<1","ruff>=0.16.7,<1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+mlops_cp = ["schemas/*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
