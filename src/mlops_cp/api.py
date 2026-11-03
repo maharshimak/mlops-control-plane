@@ -6,7 +6,13 @@ from dataclasses import asdict
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from mlops_cp.models import Evaluation, ModelVersion
+from mlops_cp.lifecycle import InvalidLifecycleTransition
+from mlops_cp.models import (
+    MODEL_NAME_PATTERN,
+    MODEL_VERSION_PATTERN,
+    Evaluation,
+    ModelVersion,
+)
 from mlops_cp.registry import ModelRegistry
 
 app = FastAPI(
@@ -23,8 +29,8 @@ registry = ModelRegistry(os.environ.get("MLOPS_CP_DB_PATH", "./data/control-plan
 class RegisterRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1, max_length=200)
-    version: str = Field(min_length=1, max_length=100)
+    name: str = Field(pattern=MODEL_NAME_PATTERN)
+    version: str = Field(pattern=MODEL_VERSION_PATTERN)
     artifact_uri: str = Field(min_length=1, max_length=2000)
     dataset_fingerprint: str = Field(min_length=1, max_length=500)
 
@@ -142,6 +148,8 @@ def promote_candidate(name: str, version: str) -> dict[str, object]:
         return asdict(decision)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="model not found") from error
+    except InvalidLifecycleTransition as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @app.post("/v1/models/{name}/{version}/production", dependencies=protected)

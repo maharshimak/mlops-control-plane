@@ -2,6 +2,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from math import isfinite
 
+# Registry keys are "name:version", so neither part may contain ":" (otherwise
+# "a:b"/"c" and "a"/"b:c" collide). Enforced at the API and contract boundaries.
+MODEL_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$"
+MODEL_VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,99}$"
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
