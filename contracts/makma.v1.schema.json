@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://maharshimak.github.io/makma-ai-os/contracts/makma.v1.schema.json",
+  "title": "MAK'MA execution envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "system", "operation", "run_id", "correlation_id", "trace_id", "span_id", "status", "execution_mode", "data", "error", "provenance", "policy", "started_at", "duration_ms"],
+  "properties": {
+    "contract_version": {"const": "makma.v1"},
+    "system": {"enum": ["makma-ai-os", "agentic-rag-engine", "multimodal-ai-studio", "knowledge-twin", "secure-data-copilot", "clinical-document-intelligence", "llm-eval-observability", "mlops-control-plane", "mlops-production-pipeline"]},
+    "operation": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+    "run_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "correlation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "trace_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "span_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+    "status": {"enum": ["ok", "error", "blocked", "pending_approval"]},
+    "execution_mode": {"enum": ["deterministic_offline", "local_model", "remote_model"]},
+    "data": {},
+    "error": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message", "retryable", "details"],
+          "properties": {
+            "code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$"},
+            "message": {"type": "string", "maxLength": 2000},
+            "retryable": {"type": "boolean"},
+            "details": {"type": "object"}
+          }
+        }
+      ]
+    },
+    "provenance": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "id", "sha256", "span", "uri"],
+        "properties": {
+          "kind": {"enum": ["document", "chunk", "artifact", "dataset", "model", "query", "record"]},
+          "id": {"type": "string", "minLength": 1},
+          "sha256": {"oneOf": [{"type": "null"}, {"type": "string", "pattern": "^[0-9a-f]{64}$"}]},
+          "span": {"oneOf": [{"type": "null"}, {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 2, "maxItems": 2}]},
+          "uri": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "policy": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["decision", "reasons"],
+          "properties": {
+            "decision": {"enum": ["allow", "deny", "requires_approval"]},
+            "reasons": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      ]
+    },
+    "started_at": {"type": "string", "format": "date-time"},
+    "duration_ms": {"type": "number", "minimum": 0}
+  },
+  "allOf": [
+    {"if": {"properties": {"status": {"const": "ok"}}}, "then": {"properties": {"error": {"type": "null"}}}},
+    {"if": {"properties": {"status": {"enum": ["error", "blocked"]}}}, "then": {"properties": {"error": {"type": "object"}, "data": {"type": "null"}}}},
+    {"if": {"properties": {"status": {"const": "pending_approval"}}}, "then": {"properties": {"policy": {"type": "object", "properties": {"decision": {"const": "requires_approval"}}}}}}
+  ]
+}
