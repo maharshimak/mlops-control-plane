@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/maharshimak/mlops-production-pipeline/contracts/candidate-evaluation.v1.schema.json",
+  "title": "MLOps candidate evaluation export v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "model_id", "dataset_sha256", "config_sha256", "code_version", "metrics", "artifact_sha256", "gate", "run_record_sha256"],
+  "properties": {
+    "format": {"const": "mlops-candidate-evaluation.v1"},
+    "model_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}-[0-9a-f]{16}$"},
+    "dataset_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "code_version": {"type": "string", "minLength": 1, "maxLength": 128},
+    "metrics": {
+      "type": "object",
+      "required": ["train_mae", "test_mae", "test_rmse", "test_max_abs_error", "test_rows_with_train_feature_match", "max_feature_psi"],
+      "additionalProperties": {"type": "number", "minimum": 0}
+    },
+    "artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "reasons"],
+      "properties": {
+        "allowed": {"type": "boolean"},
+        "reasons": {"type": "array", "items": {"type": "string"}}
+      },
+      "if": {"properties": {"allowed": {"const": true}}},
+      "then": {"properties": {"reasons": {"maxItems": 0}}},
+      "else": {"properties": {"reasons": {"minItems": 1}}}
+    },
+    "run_record_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

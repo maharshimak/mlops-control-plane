@@ -371,6 +371,16 @@ class GovernanceService:
             checks["evidence_matches_registry"] = consistent
             if not consistent:
                 reasons.append("registry artifact URI or dataset fingerprint differs from evidence")
+            if evidence.pipeline_gate is not None:
+                # The producing pipeline's own quality gate is binding, never advisory.
+                checks["pipeline_gate"] = evidence.pipeline_gate.allowed
+                if not evidence.pipeline_gate.allowed:
+                    reasons.append(
+                        "pipeline gate rejected candidate: "
+                        + "; ".join(evidence.pipeline_gate.reasons)
+                    )
+            if evidence.code_version == "unknown":
+                warnings.append("code_version is 'unknown'; the training code is not pinned")
 
         if policy.require_artifact_verification:
             verified = False

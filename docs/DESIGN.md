@@ -19,6 +19,7 @@ The API registry is SQLite-backed (`MLOPS_CP_DB_PATH`) and survives restart; the
 Trust boundaries:
 
 - Evidence digests (`artifact_sha256`, `dataset_fingerprint`, `config_sha256`, `code_version`) are producer claims. The control plane recomputes `config_sha256` when `config` is supplied, and the artifact digest when `verify_artifact` receives the bytes or a path confined to `MLOPS_CP_ARTIFACT_ROOT`.
+- `mlops-production-pipeline` exports (`mlops-candidate-evaluation.v1`) are validated against a vendored copy of that repository's JSON Schema and mapped field by field; the pipeline's own gate is binding (a rejected gate denies promotion). Its `run_record_sha256` is stored as a claim; the run record is not supplied, so it is not re-verified.
 - The promotion policy is server configuration. Requests can supply drift observations but cannot relax approvals, required metrics or drift thresholds.
 - The audit chain is tamper-evident, not tamper-proof: no signatures or external anchoring are built in. Tail truncation is detected only against a caller-held `expected_head`.
 - Writes across stores are not one transaction. Ordering makes partial failures fail closed (a model without evidence, or without a verification event, is denied).

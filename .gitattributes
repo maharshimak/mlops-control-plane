@@ -1,0 +1,2 @@
+# Artifact bytes are hashed; never rewrite line endings.
+tests/fixtures/*.model.json binary

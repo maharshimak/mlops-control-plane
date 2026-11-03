@@ -19,14 +19,27 @@ from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, datetime
 from importlib import metadata
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    RootModel,
+    Tag,
+    ValidationError,
+    model_validator,
+)
 
 from mlops_cp.artifacts import ArtifactAccessError
 from mlops_cp.audit import sha256_json
 from mlops_cp.canary import CanarySnapshot
-from mlops_cp.evidence import CandidateEvidence
+from mlops_cp.evidence import (
+    CandidateEvidence,
+    PipelineExportError,
+    evidence_from_pipeline_export,
+)
 from mlops_cp.governed import (
     DriftObservation,
     GovernanceError,
@@ -221,8 +234,58 @@ class AuditLogInput(_Input):
         return self
 
 
+class PipelineRegistrationInput(_Input):
+    """Wraps an ``mlops-candidate-evaluation.v1`` export with registry identity.
+
+    The export is validated against the vendored JSON Schema in the handler.
+    """
+
+    pipeline_export: dict[str, Any]
+    model_name: str = Field(pattern=MODEL_NAME_PATTERN)
+    model_version: str = Field(pattern=MODEL_VERSION_PATTERN)
+    artifact_uri: str = Field(min_length=1, max_length=2000)
+    submitted_by: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+def _register_input_kind(value: Any) -> str:
+    return "pipeline" if isinstance(value, dict) and "pipeline_export" in value else "evidence"
+
+
+class RegisterCandidateInput(RootModel[
+    Annotated[
+        Annotated[PipelineRegistrationInput, Tag("pipeline")]
+        | Annotated[CandidateEvidence, Tag("evidence")],
+        Discriminator(_register_input_kind),
+    ]
+]):
+    pass
+
+
 # ---------------------------------------------------------------- handlers
-def _register_candidate(service: GovernanceService, payload: CandidateEvidence) -> OperationOutcome:
+def _register_candidate(
+    service: GovernanceService, parsed: RegisterCandidateInput
+) -> OperationOutcome:
+    request = parsed.root
+    if isinstance(request, PipelineRegistrationInput):
+        try:
+            payload = evidence_from_pipeline_export(
+                request.pipeline_export,
+                model_name=request.model_name,
+                model_version=request.model_version,
+                artifact_uri=request.artifact_uri,
+                submitted_by=request.submitted_by,
+            )
+        except PipelineExportError as error:
+            raise OperationFailure(
+                "INVALID_INPUT", str(error), details={"errors": error.errors}
+            ) from error
+        except ValidationError as error:
+            raise OperationFailure(
+                "INVALID_INPUT", "pipeline export could not be mapped to candidate evidence",
+                details=_validation_details(error),
+            ) from error
+    else:
+        payload = request
     model, digest = service.register_candidate(payload)
     return OperationOutcome(
         data={
@@ -232,6 +295,13 @@ def _register_candidate(service: GovernanceService, payload: CandidateEvidence) 
             "claimed_artifact_sha256": payload.artifact_sha256,
             "artifact_verified": False,
             "evaluations": [asdict(item) | {"passed": item.passed} for item in model.evaluations],
+            "source_format": payload.source_format or payload.schema_version,
+            "pipeline_model_id": payload.pipeline_model_id,
+            "run_record_sha256": payload.run_record_sha256,
+            "pipeline_gate": (
+                payload.pipeline_gate.model_dump() if payload.pipeline_gate else None
+            ),
+            "observed_metrics": dict(payload.observed_metrics),
             "audit_head": service.audit.verify().head_hash,
         },
         provenance=[
@@ -385,7 +455,7 @@ def _audit_log(service: GovernanceService, payload: AuditLogInput) -> OperationO
 
 _OPERATIONS: dict[str, tuple[type[BaseModel], Callable[..., OperationOutcome], bool, int]] = {
     # name: (input model, handler, side_effects, timeout_s)
-    "register_candidate": (CandidateEvidence, _register_candidate, True, 30),
+    "register_candidate": (RegisterCandidateInput, _register_candidate, True, 30),
     "verify_artifact": (VerifyArtifactInput, _verify_artifact, True, 120),
     "evaluate_promotion": (EvaluatePromotionInput, _evaluate_promotion, False, 30),
     "rollback_decision": (RollbackDecisionInput, _rollback_decision, False, 10),

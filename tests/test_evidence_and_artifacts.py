@@ -31,7 +31,7 @@ def test_valid_pipeline_evidence_round_trips_with_a_stable_digest() -> None:
         ({"config": {"learning_rate": 0.2}}, "config_sha256 does not match"),
         ({"artifact_sha256": "ABC"}, "artifact_sha256"),
         ({"dataset_fingerprint": "not-a-digest"}, "dataset_fingerprint"),
-        ({"code_version": "main"}, "code_version"),
+        ({"code_version": "has space"}, "code_version"),
         ({"model_name": "fraud:prod"}, "model_name"),
         ({"model_version": ""}, "model_version"),
         ({"schema_version": "candidate-evidence.v0"}, "schema_version"),

@@ -8,6 +8,7 @@ The format follows the intent of [Keep a Changelog](https://keepachangelog.com/)
 
 ### Governance
 - Added `candidate-evidence.v1` schema for pipeline-produced candidate evaluations.
+- `register_candidate` accepts `mlops-production-pipeline` `mlops-candidate-evaluation.v1` exports, validated against the vendored schema; a failed pipeline gate blocks promotion. `jsonschema` is now a runtime dependency.
 - Added SHA-256 artifact verification with artifact-root path confinement.
 - Added append-only, hash-chained audit log with tamper detection.
 - Added governed promotion policy (artifact verified, gates, required metrics, drift, approvals) reporting every failing reason; `requires_approval` when only approvals are missing.

@@ -121,7 +121,19 @@ if decision.allowed:
 
 `mlops_cp.governed.GovernanceService` wraps the registry with stricter, auditable promotion:
 
-- **Candidate evidence** (`mlops_cp.evidence.CandidateEvidence`, schema `candidate-evidence.v1`): the hand-off format for a training pipeline such as `mlops-production-pipeline`. It carries `producer`, `model_name`, `model_version`, `artifact_uri`, `artifact_sha256`, `dataset_fingerprint` (64-hex SHA-256), `config_sha256` (optionally with the `config` object, whose canonical-JSON SHA-256 must match), `code_version` (7-40 hex commit), `metrics` (unique names, finite values and thresholds, direction) and optional `submitted_by`. Unknown fields are rejected. Evidence rows are insert-only.
+- **Candidate evidence** (`mlops_cp.evidence.CandidateEvidence`, schema `candidate-evidence.v1`): the hand-off format for a training pipeline such as `mlops-production-pipeline`. It carries `producer`, `model_name`, `model_version`, `artifact_uri`, `artifact_sha256`, `dataset_fingerprint` (64-hex SHA-256), `config_sha256` (optionally with the `config` object, whose canonical-JSON SHA-256 must match), `code_version` (commit SHA, tag or `unknown`; `unknown` produces a policy warning), `metrics` (unique names, finite values and thresholds, direction) and optional `submitted_by`. Unknown fields are rejected. Evidence rows are insert-only.
+- **Pipeline export** (`mlops-candidate-evaluation.v1`, produced by `mlops-production-pipeline`'s `evaluate_candidate` operation): `evidence_from_pipeline_export` validates the document against a vendored copy of the pipeline's JSON Schema (`src/mlops_cp/schemas/candidate-evaluation.v1.schema.json`), checks that the `model_id` suffix equals the first 16 hex characters of `artifact_sha256`, and maps it explicitly:
+
+  | Export field | Evidence field |
+  | --- | --- |
+  | `dataset_sha256` | `dataset_fingerprint` |
+  | `config_sha256`, `artifact_sha256`, `code_version`, `run_record_sha256` | same names |
+  | `model_id` | `pipeline_model_id` |
+  | `metrics` | `observed_metrics` (informational; the export has no thresholds and none are invented) |
+  | `gate` | `pipeline_gate`, plus one registry evaluation `pipeline_gate` = 1.0 if allowed else 0.0, threshold 1.0 |
+  | (wrapper) `model_name`, `model_version`, `artifact_uri`, `submitted_by` | same names; `producer` = `mlops-production-pipeline` |
+
+  A pipeline gate with `allowed: false` is recorded at registration and is a blocking promotion reason (`pipeline gate rejected candidate: ...`). `run_record_sha256` is stored but not re-verified, since the run record itself is not supplied.
 - **Artifact integrity**: `verify_artifact` hashes artifact bytes (supplied inline, or read from a relative path confined to `MLOPS_CP_ARTIFACT_ROOT`; absolute paths, `..` traversal and escaping symlinks are refused) and compares them with the registered `artifact_sha256`. Every attempt, successful or not, is written to the audit log; the latest attempt decides.
 - **Promotion policy** (`evaluate_promotion`) reports every failing reason at once: audit chain intact, promotable lifecycle stage, evidence recorded and consistent with the registry row, artifact verified, all evaluation gates passing plus any server-configured required metrics, no drift at or above the denial severity (PSI computed from supplied bin counts), and enough distinct approvals. If approvals are the only thing missing, the decision is `requires_approval`; otherwise `deny`. The policy is configured on the service (`MLOPS_CP_REQUIRED_APPROVALS`, default 1; `MLOPS_CP_REQUIRED_METRICS`, comma-separated), not by the request being judged.
 - **Approvals**: one per approver per model, bound to the evidence digest; the evidence submitter cannot approve their own model. `POST /v1/governance/{name}/{version}/approvals` records one. The approver name is asserted by the caller; there is no per-user identity behind the shared bearer token.
@@ -134,7 +146,7 @@ if decision.allowed:
 
 | Operation | Input | `data` / status |
 | --- | --- | --- |
-| `register_candidate` | `candidate-evidence.v1` object | `model_key`, `stage`, `evidence_sha256`, claimed artifact digest, `artifact_verified: false`, evaluations, audit head. `CONFLICT` on duplicates. |
+| `register_candidate` | `candidate-evidence.v1` object, or `{pipeline_export, model_name, model_version, artifact_uri, submitted_by?}` | `model_key`, `stage`, `evidence_sha256`, claimed artifact digest, `artifact_verified: false`, evaluations, source format, pipeline gate and observed metrics, audit head. `CONFLICT` on duplicates; schema or integrity failures of a pipeline export are `INVALID_INPUT` with field locations. |
 | `verify_artifact` | `model_name`, `model_version`, exactly one of `path` (relative to the artifact root) or `content_base64` (at most 8 MiB decoded) | `verified`, expected/actual SHA-256, size. Path mode without a configured root is `blocked` (`ARTIFACT_ROOT_NOT_CONFIGURED`); escaping paths are `ARTIFACT_ACCESS_DENIED`. |
 | `evaluate_promotion` | `model_name`, `model_version`, optional `drift: [{feature, expected, actual}]` | Decision, reasons, warnings, per-check booleans, approvals, drift PSI. `ok` with `policy.decision=allow`; `pending_approval` with `requires_approval`; `blocked` with `PROMOTION_DENIED` and `deny`. Read-only. |
 | `rollback_decision` | `telemetry` and/or `canary` (production/candidate snapshots, current traffic stage), optional rollback thresholds | `action` (`rollback`, `hold`, `continue`, `increase`, `promote`, `complete`), `rollback`, reasons, the underlying decisions, `deployment_executed: false`. Rollback from either source wins; insufficient telemetry holds. |
