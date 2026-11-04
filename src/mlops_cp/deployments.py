@@ -39,12 +39,20 @@ class DeploymentTarget(Protocol):
     def execute(self, command: DeploymentCommand) -> DeploymentReceipt: ...
 
 
+class _NoDeploymentRedirects(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Keep credentials and commands at the explicitly configured endpoint.
+        # urllib may otherwise forward Authorization and turn POST into GET.
+        return None
+
+
 @dataclass(slots=True)
 class HTTPDeploymentTarget:
     """Explicit outbound deployment boundary for an infrastructure controller.
 
     HTTPS is required except for localhost development. The target receives a
     small typed command rather than arbitrary code or shell instructions.
+    Redirect responses fail with HTTPError; configure the final controller URL.
     """
 
     endpoint: str
@@ -75,7 +83,8 @@ class HTTPDeploymentTarget:
         if self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
         req = request.Request(self.endpoint, data=payload, headers=headers, method="POST")
-        with request.urlopen(req, timeout=self.timeout_seconds) as response:
+        opener = request.build_opener(_NoDeploymentRedirects())
+        with opener.open(req, timeout=self.timeout_seconds) as response:
             body = json.loads(response.read().decode() or "{}")
         return DeploymentReceipt(
             accepted=bool(body.get("accepted", False)),
