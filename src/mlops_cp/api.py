@@ -9,7 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 
 from mlops_cp.contracts import capabilities, policy_from_env, run_operation
-from mlops_cp.governed import GovernanceError, GovernanceService
+from mlops_cp.governed import GovernanceService
 from mlops_cp.lifecycle import InvalidLifecycleTransition
 from mlops_cp.models import (
     MODEL_NAME_PATTERN,
@@ -34,6 +34,7 @@ governance = GovernanceService(
     database_path=None if _db_path == ":memory:" else _db_path,
     policy=policy_from_env(),
     artifact_root=os.environ.get("MLOPS_CP_ARTIFACT_ROOT") or None,
+    trusted_inputs=False,
 )
 
 
@@ -72,7 +73,7 @@ async def require_auth(
         if (
             scheme.lower() != "bearer"
             or not supplied
-            or not secrets.compare_digest(supplied, token)
+            or not secrets.compare_digest(supplied.encode(), token.encode())
         ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -173,25 +174,21 @@ def promote_candidate(name: str, version: str) -> dict[str, object]:
 @app.post("/v1/models/{name}/{version}/production", dependencies=protected)
 def promote_production(name: str, version: str) -> dict[str, str]:
     try:
-        registry.promote_production(name, version)
-        return {"stage": "production"}
+        registry.get(name, version)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="model not found") from error
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+    raise HTTPException(
+        status_code=403,
+        detail="Production transitions require trusted governance evidence and principals.",
+    )
 
 
 @app.post("/v1/governance/{name}/{version}/approvals", dependencies=protected)
 def record_approval(name: str, version: str, request: ApprovalRequest) -> dict[str, object]:
-    """Record a named approval. The approver name is asserted by the caller."""
-    try:
-        approval = governance.record_approval(name, version, request.approver, request.note)
-    except KeyError as error:
-        raise HTTPException(status_code=404, detail="model not found") from error
-    except GovernanceError as error:
-        code = 409 if error.code == "CONFLICT" else 400
-        raise HTTPException(status_code=code, detail=str(error)) from error
-    return asdict(approval)
+    raise HTTPException(
+        status_code=403,
+        detail="Approvals require an authenticated individual principal.",
+    )
 
 
 @app.get("/v1/capabilities", dependencies=protected)

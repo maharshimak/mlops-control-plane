@@ -1,6 +1,6 @@
 # Security
 
-The API registry is process-local and loses state on restart. JSONL state, lineage and canary helpers are separate utilities, not deployment integrations. Artifact URIs are metadata; artifacts are not uploaded or verified. Registered models enter through gates, but library callers receive mutable model objects and are trusted. Thresholds are supplied by callers rather than an independent governance authority. No authentication, durable transactional registry, cloud deployment or automated rollback is implemented.
+The SQLite registry commits lifecycle and governance audit records with the associated state changes. The HTTP API's shared bearer credential cannot establish submitter or approver identity. HTTP approval and production mutations are disabled. Governed production commits are available through the trusted Python interface, which requires trusted evidence and separately verified principals when approvals are required. Artifact verification checks SHA-256 and file confinement. Verification of external artifact identity and deployment-time digest enforcement belong to the trusted artifact or controller integration.
 
 Use synthetic or explicitly authorized public data. Do not commit API keys, databases, model credentials, patient records or private employer material. Remote model adapters transmit supplied text to the configured endpoint; choose the provider deliberately.
 

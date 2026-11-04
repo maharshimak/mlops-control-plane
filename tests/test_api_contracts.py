@@ -18,7 +18,7 @@ def client(monkeypatch):
     monkeypatch.setenv("MLOPS_CP_API_TOKEN", TOKEN)
     registry = ModelRegistry()
     monkeypatch.setattr(api, "registry", registry)
-    monkeypatch.setattr(api, "governance", GovernanceService(registry))
+    monkeypatch.setattr(api, "governance", GovernanceService(registry, trusted_inputs=False))
     return TestClient(api.app)
 
 
@@ -30,6 +30,11 @@ def test_contract_routes_require_the_existing_bearer_auth(client) -> None:
     caps = client.get("/v1/capabilities", headers=AUTH)
     assert caps.status_code == 200
     assert caps.json()["system"] == "mlops-control-plane"
+
+
+def test_non_ascii_bearer_is_rejected_without_error(client) -> None:
+    response = client.get("/v1/capabilities", headers=[(b"Authorization", b"Bearer \xe9")])
+    assert response.status_code == 401
 
 
 def test_ops_route_runs_the_governed_flow_and_shares_the_registry(client) -> None:
@@ -48,21 +53,20 @@ def test_ops_route_runs_the_governed_flow_and_shares_the_registry(client) -> Non
     }).json())
     ref = {"model_name": "fraud", "model_version": "1.0.0"}
     pending = valid(client.post("/v1/ops/evaluate_promotion", headers=AUTH, json=ref).json())
-    assert pending["status"] == "pending_approval"
+    assert pending["status"] == "blocked"
+    assert pending["policy"]["decision"] == "deny"
+    assert pending["error"]["code"] == "PROMOTION_DENIED"
 
     denied = client.post("/v1/governance/fraud/1.0.0/approvals", headers=AUTH,
                          json={"approver": "pipeline-bot"})
-    assert denied.status_code == 400  # submitter cannot approve
-    approved = client.post("/v1/governance/fraud/1.0.0/approvals", headers=AUTH,
-                           json={"approver": "risk-officer", "note": "synthetic review"})
-    assert approved.status_code == 200
-    assert client.post("/v1/governance/fraud/1.0.0/approvals", headers=AUTH,
-                       json={"approver": "risk-officer"}).status_code == 409
-    assert client.post("/v1/governance/nope/1/approvals", headers=AUTH,
-                       json={"approver": "a"}).status_code == 404
-
-    allowed = valid(client.post("/v1/ops/evaluate_promotion", headers=AUTH, json=ref).json())
-    assert allowed["status"] == "ok" and allowed["policy"]["decision"] == "allow"
+    assert denied.status_code == 403
+    spoofed = client.post("/v1/governance/fraud/1.0.0/approvals", headers=AUTH,
+                          json={"approver": "risk-officer", "note": "synthetic review"})
+    assert spoofed.status_code == 403
+    assert api.governance.approvals("fraud:1.0.0") == []
+    still_pending = valid(client.post("/v1/ops/evaluate_promotion", headers=AUTH, json=ref).json())
+    assert still_pending["status"] == "blocked"
+    assert still_pending["policy"]["decision"] == "deny"
 
 
 @pytest.mark.parametrize("raw", [b"{not json", b"[1, 2]", b"\"text\""])

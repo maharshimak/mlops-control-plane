@@ -20,12 +20,12 @@ import json
 import sqlite3
 import threading
 from collections.abc import Mapping
-from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from mlops_cp.models import utc_now
+from mlops_cp.storage import connect, transaction
 
 GENESIS_HASH = "0" * 64
 
@@ -84,21 +84,17 @@ class AuditLog:
         if database_path == ":memory:":
             # Each sqlite3 connection to ":memory:" is a separate empty database.
             raise ValueError("use database_path=None for an in-memory audit log")
-        self.database_path = database_path
+        self.database_path = (
+            str(Path(database_path).expanduser().resolve()) if database_path is not None else None
+        )
         self._events: list[AuditEvent] = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         if database_path is not None:
             self._initialize_storage()
 
-    def _connect(self) -> sqlite3.Connection:
-        assert self.database_path is not None
-        Path(self.database_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.database_path, isolation_level=None, timeout=30)
-        connection.row_factory = sqlite3.Row
-        return connection
-
     def _initialize_storage(self) -> None:
-        with closing(self._connect()) as connection:
+        assert self.database_path is not None
+        with connect(self.database_path) as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS audit_events (
@@ -136,36 +132,21 @@ class AuditLog:
                 self._events.append(event)
                 return event
 
-        with closing(self._connect()) as connection:
-            # BEGIN IMMEDIATE takes the write lock before reading the head, so two
-            # writers can never chain onto the same predecessor.
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                row = connection.execute(
-                    "SELECT * FROM audit_events ORDER BY seq DESC LIMIT 1"
-                ).fetchone()
-                previous = self._row_to_event(row) if row is not None else None
-                event = self._build(previous, event_type, subject, clean_payload)
-                connection.execute(
-                    """
-                    INSERT INTO audit_events(
-                        seq, event_type, subject, payload_json, created_at, prev_hash, hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        event.seq,
-                        event.event_type,
-                        event.subject,
-                        canonical_json(event.payload),
-                        event.created_at,
-                        event.prev_hash,
-                        event.hash,
-                    ),
-                )
-                connection.execute("COMMIT")
-            except BaseException:
-                connection.execute("ROLLBACK")
-                raise
+        with transaction(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT * FROM audit_events ORDER BY seq DESC LIMIT 1"
+            ).fetchone()
+            previous = self._row_to_event(row) if row is not None else None
+            event = self._build(previous, event_type, subject, clean_payload)
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    seq, event_type, subject, payload_json, created_at, prev_hash, hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (event.seq, event.event_type, event.subject, canonical_json(event.payload),
+                 event.created_at, event.prev_hash, event.hash),
+            )
         return event
 
     @staticmethod
@@ -187,11 +168,14 @@ class AuditLog:
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> AuditEvent:
+        payload = json.loads(row["payload_json"])
+        if not isinstance(payload, dict):
+            raise TypeError("Audit event payload must be a JSON object.")
         return AuditEvent(
             seq=row["seq"],
             event_type=row["event_type"],
             subject=row["subject"],
-            payload=json.loads(row["payload_json"]),
+            payload=payload,
             created_at=row["created_at"],
             prev_hash=row["prev_hash"],
             hash=row["hash"],
@@ -212,7 +196,7 @@ class AuditLog:
         if subject is not None:
             query += " WHERE subject = ?"
             params = (subject,)
-        with closing(self._connect()) as connection:
+        with connect(self.database_path) as connection:
             rows = connection.execute(query + " ORDER BY seq ASC", params).fetchall()
         return [self._row_to_event(row) for row in rows]
 
