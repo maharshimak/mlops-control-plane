@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from mlops_cp.lifecycle import validate_transition
@@ -168,6 +168,126 @@ class ModelRegistry:
                 ),
             )
 
+    def _append_evaluation_durably(
+        self, model_key: str, evaluation: Evaluation
+    ) -> ModelVersion:
+        """Serialize evaluation appends against concurrent writers.
+
+        BEGIN IMMEDIATE protects the read/append/write transaction; updating only
+        the evaluation column prevents a stale worker from reverting the stage.
+        """
+        if self.database_path is None:
+            raise RuntimeError("Registry persistence is not configured.")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT name, version, artifact_uri, dataset_fingerprint,
+                       stage, evaluations_json, created_at
+                FROM model_versions WHERE model_key = ?
+                """,
+                (model_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown model version: {model_key}")
+            evaluations = [
+                Evaluation(**entry) for entry in json.loads(row["evaluations_json"])
+            ]
+            updated = ModelVersion(
+                name=row["name"],
+                version=row["version"],
+                artifact_uri=row["artifact_uri"],
+                dataset_fingerprint=row["dataset_fingerprint"],
+                stage=row["stage"],
+                evaluations=[*evaluations, evaluation],
+                created_at=row["created_at"],
+            )
+            serialized = json.dumps(
+                [asdict(entry) for entry in updated.evaluations],
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            connection.execute(
+                "UPDATE model_versions SET evaluations_json = ? WHERE model_key = ?",
+                (serialized, model_key),
+            )
+            connection.commit()
+        return updated
+
+    def _persist_registration_with_event(
+        self, model: ModelVersion, event: LifecycleEvent
+    ) -> None:
+        """Register a new model and its audit event in one SQLite transaction.
+
+        A plain INSERT (rather than an upsert) rejects registrations racing
+        across processes instead of silently replacing an existing version.
+        """
+        if self.database_path is None:
+            raise RuntimeError("Registry persistence is not configured.")
+        evaluations = json.dumps(
+            [asdict(value) for value in model.evaluations],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO model_versions(
+                    model_key, name, version, artifact_uri, dataset_fingerprint,
+                    stage, evaluations_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    model.key, model.name, model.version, model.artifact_uri,
+                    model.dataset_fingerprint, model.stage, evaluations, model.created_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO lifecycle_events(
+                    model_key, from_stage, to_stage, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event.model_key, event.from_stage, event.to_stage,
+                    event.reason, event.created_at,
+                ),
+            )
+            connection.commit()
+
+    def _persist_candidate_with_event(
+        self, model: ModelVersion, event: LifecycleEvent
+    ) -> None:
+        """CAS lifecycle transition plus durable audit, or no mutation."""
+        if self.database_path is None:
+            raise RuntimeError("Registry persistence is not configured.")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            result = connection.execute(
+                """
+                UPDATE model_versions SET stage = 'candidate'
+                WHERE model_key = ? AND stage = ?
+                """,
+                (model.key, event.from_stage),
+            )
+            if result.rowcount != 1:
+                raise RuntimeError(
+                    f"Concurrent lifecycle update detected for {model.key}."
+                )
+            connection.execute(
+                """
+                INSERT INTO lifecycle_events(
+                    model_key, from_stage, to_stage, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event.model_key, event.from_stage, event.to_stage,
+                    event.reason, event.created_at,
+                ),
+            )
+            connection.commit()
+
     def history(self, name: str, version: str) -> list[LifecycleEvent]:
         model_key = f"{name}:{version}"
         if self.database_path is None:
@@ -190,14 +310,19 @@ class ModelRegistry:
             raise ValueError(f"Model version already exists: {model.key}")
         if model.stage != "registered":
             raise ValueError("New models must enter in the registered stage.")
-        self._models[model.key] = model
-        self._persist(model)
-        self._record_transition(
-            model,
+        event = LifecycleEvent(
+            model_key=model.key,
             from_stage=None,
             to_stage="registered",
             reason="model registered",
         )
+        # Do not advertise a model or an event until BOTH durable writes commit.
+        if self.database_path is None:
+            self._persist(model)
+        else:
+            self._persist_registration_with_event(model, event)
+        self._models[model.key] = model
+        self._events.append(event)
         return model
 
     def get(self, name: str, version: str) -> ModelVersion:
@@ -211,9 +336,15 @@ class ModelRegistry:
         evaluation: Evaluation,
     ) -> ModelVersion:
         model = self.get(name, version)
-        model.evaluations.append(evaluation)
-        self._persist(model)
-        return model
+        if self.database_path is None:
+            # Preserve the in-memory persistence hook used by test doubles.
+            updated = replace(model, evaluations=[*model.evaluations, evaluation])
+            self._persist(updated)
+        else:
+            # Refresh evaluation data *inside* a write transaction, not before it.
+            updated = self._append_evaluation_durably(model.key, evaluation)
+        self._models[updated.key] = updated
+        return updated
 
     def promote_candidate(
         self,
@@ -225,15 +356,21 @@ class ModelRegistry:
         if decision.allowed:
             previous = model.stage
             validate_transition(previous, "candidate")
-            model.stage = "candidate"
-            self._persist(model)
             if previous != "candidate":
-                self._record_transition(
-                    model,
+                event = LifecycleEvent(
+                    model_key=model.key,
                     from_stage=previous,
                     to_stage="candidate",
                     reason="promotion policy satisfied",
                 )
+                if self.database_path is None:
+                    # Preserve in-memory behavior without mutating shared state
+                    # before its persistence hook reports success.
+                    self._persist(replace(model, stage="candidate"))
+                else:
+                    self._persist_candidate_with_event(model, event)
+                model.stage = "candidate"
+                self._events.append(event)
         return decision
 
     def promote_production(self, name: str, version: str) -> None:
