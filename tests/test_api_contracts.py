@@ -32,6 +32,11 @@ def test_contract_routes_require_the_existing_bearer_auth(client) -> None:
     assert caps.json()["system"] == "mlops-control-plane"
 
 
+def test_non_ascii_bearer_is_rejected_without_error(client) -> None:
+    response = client.get("/v1/capabilities", headers=[(b"Authorization", b"Bearer \xe9")])
+    assert response.status_code == 401
+
+
 def test_ops_route_runs_the_governed_flow_and_shares_the_registry(client) -> None:
     registered = client.post("/v1/ops/register_candidate", json=evidence_payload(),
                              headers={**AUTH, "X-Run-Id": "api-run", "X-Correlation-Id": "c-1"})
@@ -48,7 +53,9 @@ def test_ops_route_runs_the_governed_flow_and_shares_the_registry(client) -> Non
     }).json())
     ref = {"model_name": "fraud", "model_version": "1.0.0"}
     pending = valid(client.post("/v1/ops/evaluate_promotion", headers=AUTH, json=ref).json())
-    assert pending["status"] == "pending_approval"
+    assert pending["status"] == "blocked"
+    assert pending["policy"]["decision"] == "deny"
+    assert pending["error"]["code"] == "PROMOTION_DENIED"
 
     denied = client.post("/v1/governance/fraud/1.0.0/approvals", headers=AUTH,
                          json={"approver": "pipeline-bot"})
@@ -58,7 +65,8 @@ def test_ops_route_runs_the_governed_flow_and_shares_the_registry(client) -> Non
     assert spoofed.status_code == 403
     assert api.governance.approvals("fraud:1.0.0") == []
     still_pending = valid(client.post("/v1/ops/evaluate_promotion", headers=AUTH, json=ref).json())
-    assert still_pending["status"] == "pending_approval"
+    assert still_pending["status"] == "blocked"
+    assert still_pending["policy"]["decision"] == "deny"
 
 
 @pytest.mark.parametrize("raw", [b"{not json", b"[1, 2]", b"\"text\""])

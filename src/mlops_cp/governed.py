@@ -25,7 +25,7 @@ import json
 import sqlite3
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -391,7 +391,16 @@ class GovernanceService:
         *,
         drift: Sequence[DriftObservation] = (),
     ) -> GovernedDecision:
-        """Side-effect-free production-promotion decision with every failing reason."""
+        """Evaluate production eligibility against a consistent read snapshot."""
+        if self.database_path is None:
+            with self.registry._lock:
+                return self._evaluate_promotion(name, version, drift)
+        with transaction(self.database_path, write=False):
+            return self._evaluate_promotion(name, version, drift)
+
+    def _evaluate_promotion(
+        self, name: str, version: str, drift: Sequence[DriftObservation]
+    ) -> GovernedDecision:
         model = self.registry.get(name, version)  # KeyError when unknown
         model_key = model.key
         policy = self.policy
@@ -399,33 +408,59 @@ class GovernanceService:
         warnings: list[str] = []
         checks: dict[str, bool] = {}
 
-        audit_events = self.audit.events()
-        chain = verify_chain(audit_events)
-        model_events = [event for event in audit_events if event.subject == model_key]
-        checks["audit_chain_intact"] = chain.valid
-        if not chain.valid:
-            reasons.append(f"audit log integrity failure at seq {chain.first_invalid_seq}: "
-                           f"{chain.reason}")
+        model_events = []
+        try:
+            audit_events = self.audit.events()
+            chain = verify_chain(audit_events)
+        except (TypeError, ValueError):
+            checks["audit_chain_intact"] = False
+            reasons.append("audit log contains a malformed record")
+        else:
+            checks["audit_chain_intact"] = chain.valid
+            if chain.valid:
+                model_events = [event for event in audit_events if event.subject == model_key]
+            else:
+                reasons.append(
+                    f"audit log integrity failure at seq {chain.first_invalid_seq}: {chain.reason}"
+                )
 
         checks["lifecycle_stage"] = model.stage in {"registered", "candidate"}
         if not checks["lifecycle_stage"]:
             reasons.append(f"model stage {model.stage!r} cannot be promoted to production")
 
-        recorded = self.evidence(model_key)
+        try:
+            recorded = self.evidence(model_key)
+        except (TypeError, ValueError):
+            recorded = None
+            reasons.append("candidate evidence is malformed")
+        else:
+            if recorded is None:
+                reasons.append("no candidate evidence recorded")
         evidence, evidence_digest = recorded if recorded else (None, None)
         checks["evidence_recorded"] = evidence is not None
-        if evidence is None:
-            reasons.append("no candidate evidence recorded")
-        else:
+        registration = next(
+            (event.payload for event in reversed(model_events)
+             if event.event_type == "candidate_registered"),
+            {},
+        )
+        checks["trusted_promotion_service"] = self.trusted_inputs
+        if not self.trusted_inputs:
+            reasons.append("production requires a trusted governance service")
+        checks["trusted_registration"] = (
+            evidence_digest is not None
+            and registration.get("evidence_sha256") == evidence_digest
+            and registration.get("trusted_source") is True
+        )
+        if not checks["trusted_registration"]:
+            reasons.append("production requires trusted candidate registration")
+        if evidence is not None:
             consistent = (
                 evidence.artifact_uri == model.artifact_uri
                 and evidence.dataset_fingerprint == model.dataset_fingerprint
             )
             checks["evidence_digest_verified"] = (
                 evidence.sha256() == evidence_digest
-                and any(event.event_type == "candidate_registered"
-                        and event.payload.get("evidence_sha256") == evidence_digest
-                        for event in model_events)
+                and registration.get("evidence_sha256") == evidence_digest
             )
             if not checks["evidence_digest_verified"]:
                 reasons.append("candidate evidence digest does not match the audited registration")
@@ -443,16 +478,24 @@ class GovernanceService:
             if evidence.code_version == "unknown":
                 warnings.append("code_version is 'unknown'; the training code is not pinned")
 
+        latest = next(
+            (event.payload for event in reversed(model_events)
+             if event.event_type == "artifact_verification"),
+            {},
+        )
+        checks["trusted_artifact_verification"] = (
+            not policy.require_artifact_verification or latest.get("trusted_source") is True
+        )
         if policy.require_artifact_verification:
+            if not checks["trusted_artifact_verification"]:
+                reasons.append("production requires trusted artifact verification")
             verified = False
             if evidence is not None:
-                verifications = [
-                    event for event in model_events if event.event_type == "artifact_verification"
-                ]
-                if verifications:
-                    latest = verifications[-1].payload
-                    verified = bool(latest.get("verified")) and (
-                        latest.get("actual_sha256") == evidence.artifact_sha256
+                if latest:
+                    verified = (
+                        latest.get("verified") is True
+                        and latest.get("actual_sha256") == evidence.artifact_sha256
+                        and latest.get("expected_sha256") == evidence.artifact_sha256
                     )
                     if verified and latest.get("source") == "path":
                         verified = self._verify_current_file(
@@ -465,6 +508,11 @@ class GovernanceService:
                 else:
                     reasons.append("artifact has not been verified against its SHA-256")
             checks["artifact_verified"] = verified
+        checks["trusted_promotion_inputs"] = (
+            checks["trusted_promotion_service"]
+            and checks["trusted_registration"]
+            and checks["trusted_artifact_verification"]
+        )
 
         gates = evaluate_basic_gates(model)
         present = {item.name for item in evidence.metrics} if evidence is not None else set()
@@ -539,7 +587,7 @@ class GovernanceService:
     def _verify_current_file(
         self, model: ModelVersion, relative_path: str | None, expected_sha256: str
     ) -> bool:
-        if self.artifact_root is None or relative_path is None:
+        if self.artifact_root is None or not isinstance(relative_path, str):
             return False
         try:
             path = resolve_confined(self.artifact_root, relative_path)
@@ -565,27 +613,6 @@ class GovernanceService:
             decision = self.evaluate_promotion(name, version, drift=drift)
             if decision.decision != "allow":
                 return decision
-            events = self.audit.events(decision.model_key)
-            trusted_registration = any(
-                event.event_type == "candidate_registered"
-                and event.payload.get("trusted_source") is True
-                and event.payload.get("evidence_sha256") == decision.evidence_sha256
-                for event in events
-            )
-            verification = next(
-                (event for event in reversed(events) if event.event_type == "artifact_verification"),
-                None,
-            )
-            trusted_artifact = not self.policy.require_artifact_verification or (
-                verification is not None and verification.payload.get("trusted_source") is True
-            )
-            if not (self.trusted_inputs and trusted_registration and trusted_artifact):
-                return replace(
-                    decision,
-                    decision="deny",
-                    reasons=("production requires trusted registration and verification",),
-                    checks={**decision.checks, "trusted_promotion_inputs": False},
-                )
             model = self.registry.get(name, version)
             if (
                 model.stage == "registered"

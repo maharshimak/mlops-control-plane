@@ -197,8 +197,10 @@ def test_shared_credential_evidence_cannot_be_reused_for_trusted_commit(tmp_path
     with pytest.raises(GovernanceError, match="individual principal"):
         shared.record_approval("fraud", "1.0.0", "spoofed")
     trusted = GovernanceService(database_path=path, policy=policy)
-    assert trusted.evaluate_promotion("fraud", "1.0.0").decision == "allow"
-    assert trusted.promote_to_production("fraud", "1.0.0").decision == "deny"
+    preview = trusted.evaluate_promotion("fraud", "1.0.0")
+    assert preview.decision == "deny"
+    assert not preview.checks["trusted_registration"]
+    assert trusted.promote_to_production("fraud", "1.0.0") == preview
 
 
 @pytest.fixture()

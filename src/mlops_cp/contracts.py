@@ -342,6 +342,7 @@ def _verify_artifact(service: GovernanceService, payload: VerifyArtifactInput) -
 def _evaluate_promotion(
     service: GovernanceService, payload: EvaluatePromotionInput
 ) -> OperationOutcome:
+    """Preview the same production eligibility policy used by a governed commit."""
     decision = service.evaluate_promotion(
         payload.model_name, payload.model_version, drift=payload.drift
     )

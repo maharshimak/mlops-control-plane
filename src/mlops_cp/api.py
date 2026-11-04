@@ -73,7 +73,7 @@ async def require_auth(
         if (
             scheme.lower() != "bearer"
             or not supplied
-            or not secrets.compare_digest(supplied, token)
+            or not secrets.compare_digest(supplied.encode(), token.encode())
         ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,

@@ -22,7 +22,7 @@ Trust boundaries:
 - `mlops-production-pipeline` exports (`mlops-candidate-evaluation.v1`) are validated against a vendored copy of that repository's JSON Schema and mapped field by field; the pipeline's own gate is binding (a rejected gate denies promotion). Its `run_record_sha256` is stored as a claim; the run record is not supplied, so it is not re-verified.
 - The promotion policy is server configuration. Requests can supply drift observations but cannot relax approvals, required metrics or drift thresholds.
 - The audit chain is tamper-evident, not tamper-proof: no signatures or external anchoring are built in. Tail truncation is detected only against a caller-held `expected_head`.
-- SQLite writers acquire the lock before reading the decision inputs. Registrations, approvals and production transitions commit with their lifecycle and audit events. Failed writes roll back the whole operation.
+- Production eligibility previews read a consistent snapshot. Production writers acquire the lock before running the same decision against current state. Registration and required artifact verification must carry trusted audit provenance. Registrations, approvals and production transitions commit with their lifecycle and audit events. Failed writes roll back the whole operation.
 - The HTTP candidate route applies the basic gate. The HTTP production and approval routes return 403 under the shared credential model. The trusted Python governance service can commit a production transition after rechecking the current state, source provenance, verification, policy and approvals.
 
 ## Interfaces

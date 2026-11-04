@@ -168,11 +168,14 @@ class AuditLog:
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> AuditEvent:
+        payload = json.loads(row["payload_json"])
+        if not isinstance(payload, dict):
+            raise TypeError("Audit event payload must be a JSON object.")
         return AuditEvent(
             seq=row["seq"],
             event_type=row["event_type"],
             subject=row["subject"],
-            payload=json.loads(row["payload_json"]),
+            payload=payload,
             created_at=row["created_at"],
             prev_hash=row["prev_hash"],
             hash=row["hash"],

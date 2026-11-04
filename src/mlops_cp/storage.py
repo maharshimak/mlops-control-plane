@@ -1,4 +1,4 @@
-"""Share one SQLite writer transaction across the registry and governance stores."""
+"""Share a SQLite transaction across the registry and governance stores."""
 
 import sqlite3
 from collections.abc import Iterator
@@ -6,7 +6,7 @@ from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
-_active: ContextVar[tuple[str, sqlite3.Connection] | None] = ContextVar(
+_active: ContextVar[tuple[str, sqlite3.Connection, bool] | None] = ContextVar(
     "mlops_sqlite_transaction", default=None
 )
 
@@ -24,16 +24,18 @@ def connect(path: str) -> Iterator[sqlite3.Connection]:
 
 
 @contextmanager
-def transaction(path: str) -> Iterator[sqlite3.Connection]:
+def transaction(path: str, *, write: bool = True) -> Iterator[sqlite3.Connection]:
     active = _active.get()
     if active is not None:
         if active[0] != path:
             raise RuntimeError("A transaction cannot span separate SQLite databases.")
+        if write and not active[2]:
+            raise RuntimeError("A read snapshot cannot be upgraded to a writer transaction.")
         yield active[1]
         return
     with connect(path) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        token = _active.set((path, connection))
+        connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        token = _active.set((path, connection, write))
         try:
             with connection:
                 yield connection
