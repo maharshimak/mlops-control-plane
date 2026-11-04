@@ -2,37 +2,36 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import closing
-from dataclasses import asdict
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, replace
 from pathlib import Path
+from threading import RLock
 
 from mlops_cp.lifecycle import validate_transition
 from mlops_cp.models import Evaluation, LifecycleEvent, ModelVersion
 from mlops_cp.policy import PromotionDecision, evaluate_promotion
+from mlops_cp.storage import connect, transaction
 
 ALLOWED_STAGES = {"registered", "candidate", "production", "archived"}
 
 
 class ModelRegistry:
     def __init__(self, database_path: str | None = None) -> None:
-        self.database_path = database_path
+        self.database_path = (
+            str(Path(database_path).expanduser().resolve())
+            if database_path not in (None, ":memory:") else None
+        )
         self._models: dict[str, ModelVersion] = {}
         self._events: list[LifecycleEvent] = []
-        if database_path is not None:
+        self._lock = RLock()
+        self._governed = False
+        if self.database_path is not None:
             self._initialize_storage()
-            self._load()
-
-    def _connect(self) -> sqlite3.Connection:
-        if self.database_path is None:
-            raise RuntimeError("Registry persistence is not configured.")
-        if self.database_path != ":memory:":
-            Path(self.database_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.database_path)
-        connection.row_factory = sqlite3.Row
-        return connection
 
     def _initialize_storage(self) -> None:
-        with closing(self._connect()) as connection:
+        assert self.database_path is not None
+        with transaction(self.database_path) as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS model_versions (
@@ -67,72 +66,45 @@ class ModelRegistry:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_production_per_model "
                 "ON model_versions(name) WHERE stage = 'production'"
             )
-            connection.commit()
 
-    def _load(self) -> None:
-        with closing(self._connect()) as connection:
-            rows = connection.execute(
-                """
-                SELECT name, version, artifact_uri, dataset_fingerprint, stage,
-                       evaluations_json, created_at
-                FROM model_versions
-                ORDER BY name, version
-                """
-            ).fetchall()
-        self._models = {}
-        for row in rows:
-            evaluations = [
-                Evaluation(**item) for item in json.loads(row["evaluations_json"])
-            ]
-            model = ModelVersion(
-                name=row["name"],
-                version=row["version"],
-                artifact_uri=row["artifact_uri"],
-                dataset_fingerprint=row["dataset_fingerprint"],
-                stage=row["stage"],
-                evaluations=evaluations,
-                created_at=row["created_at"],
-            )
-            self._models[model.key] = model
-
-    def _refresh(self) -> None:
-        if self.database_path is not None:
-            self._load()
-
-    def _persist(self, model: ModelVersion) -> None:
+    @contextmanager
+    def _write(self) -> Iterator[sqlite3.Connection | None]:
         if self.database_path is None:
-            return
-        payload = json.dumps(
-            [asdict(evaluation) for evaluation in model.evaluations],
-            sort_keys=True,
-            separators=(",", ":"),
+            with self._lock:
+                yield None
+        else:
+            with transaction(self.database_path) as connection:
+                yield connection
+
+    def _read(self):
+        assert self.database_path is not None
+        return connect(self.database_path)
+
+    def _select(self, *, model_key: str | None = None) -> list[ModelVersion]:
+        if self.database_path is None:
+            with self._lock:
+                if model_key is None:
+                    return sorted(self._models.values(), key=lambda item: (item.name, item.version))
+                return [self._models[model_key]] if model_key in self._models else []
+        query = (
+            "SELECT name, version, artifact_uri, dataset_fingerprint, stage, "
+            "evaluations_json, created_at FROM model_versions"
         )
-        with closing(self._connect()) as connection, connection:
-            connection.execute(
-                """
-                INSERT INTO model_versions(
-                    model_key, name, version, artifact_uri, dataset_fingerprint,
-                    stage, evaluations_json, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(model_key) DO UPDATE SET
-                    artifact_uri = excluded.artifact_uri,
-                    dataset_fingerprint = excluded.dataset_fingerprint,
-                    stage = excluded.stage,
-                    evaluations_json = excluded.evaluations_json,
-                    created_at = excluded.created_at
-                """,
-                (
-                    model.key,
-                    model.name,
-                    model.version,
-                    model.artifact_uri,
-                    model.dataset_fingerprint,
-                    model.stage,
-                    payload,
-                    model.created_at,
-                ),
-            )
+        with self._read() as connection:
+            if model_key is None:
+                rows = connection.execute(query + " ORDER BY name, version").fetchall()
+            else:
+                rows = connection.execute(query + " WHERE model_key = ?", (model_key,)).fetchall()
+        models = []
+        for row in rows:
+            fields = dict(row)
+            evaluations = [Evaluation(**item) for item in json.loads(fields.pop("evaluations_json"))]
+            models.append(ModelVersion(**fields, evaluations=evaluations))
+        return models
+
+    @staticmethod
+    def _evaluations_json(model: ModelVersion) -> str:
+        return json.dumps([asdict(evaluation) for evaluation in model.evaluations], sort_keys=True)
 
     def _record_transition(
         self,
@@ -143,180 +115,122 @@ class ModelRegistry:
         reason: str,
     ) -> None:
         event = LifecycleEvent(
-            model_key=model.key,
-            from_stage=from_stage,
-            to_stage=to_stage,
-            reason=reason,
+            model_key=model.key, from_stage=from_stage, to_stage=to_stage, reason=reason
         )
-        self._events.append(event)
         if self.database_path is None:
+            self._events.append(event)
             return
-        with closing(self._connect()) as connection, connection:
+        with self._read() as connection:
             connection.execute(
                 """
-                INSERT INTO lifecycle_events(
-                    model_key, from_stage, to_stage, reason, created_at
-                )
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO lifecycle_events(model_key, from_stage, to_stage, reason, created_at)
+                VALUES (:model_key, :from_stage, :to_stage, :reason, :created_at)
                 """,
-                (
-                    event.model_key,
-                    event.from_stage,
-                    event.to_stage,
-                    event.reason,
-                    event.created_at,
-                ),
+                asdict(event),
             )
 
     def history(self, name: str, version: str) -> list[LifecycleEvent]:
         model_key = f"{name}:{version}"
         if self.database_path is None:
-            return [event for event in self._events if event.model_key == model_key]
-        with closing(self._connect()) as connection:
+            with self._lock:
+                return [event for event in self._events if event.model_key == model_key]
+        with self._read() as connection:
             rows = connection.execute(
                 """
                 SELECT model_key, from_stage, to_stage, reason, created_at
-                FROM lifecycle_events
-                WHERE model_key = ?
-                ORDER BY id ASC
+                FROM lifecycle_events WHERE model_key = ? ORDER BY id
                 """,
                 (model_key,),
             ).fetchall()
         return [LifecycleEvent(**dict(row)) for row in rows]
 
     def register(self, model: ModelVersion) -> ModelVersion:
-        self._refresh()
-        if model.key in self._models:
-            raise ValueError(f"Model version already exists: {model.key}")
         if model.stage != "registered":
             raise ValueError("New models must enter in the registered stage.")
-        self._models[model.key] = model
-        self._persist(model)
-        self._record_transition(
-            model,
-            from_stage=None,
-            to_stage="registered",
-            reason="model registered",
-        )
+        with self._write() as connection:
+            if self._select(model_key=model.key):
+                raise ValueError(f"Model version already exists: {model.key}")
+            if connection is not None:
+                connection.execute(
+                    """
+                    INSERT INTO model_versions(
+                        model_key, name, version, artifact_uri, dataset_fingerprint,
+                        stage, evaluations_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (model.key, model.name, model.version, model.artifact_uri,
+                     model.dataset_fingerprint, model.stage, self._evaluations_json(model),
+                     model.created_at),
+                )
+            self._record_transition(
+                model, from_stage=None, to_stage="registered", reason="model registered"
+            )
+            if connection is None:
+                self._models[model.key] = model
         return model
 
     def get(self, name: str, version: str) -> ModelVersion:
-        self._refresh()
-        return self._models[f"{name}:{version}"]
+        key = f"{name}:{version}"
+        models = self._select(model_key=key)
+        if not models:
+            raise KeyError(key)
+        return models[0]
 
-    def add_evaluation(
-        self,
-        name: str,
-        version: str,
-        evaluation: Evaluation,
-    ) -> ModelVersion:
-        model = self.get(name, version)
-        model.evaluations.append(evaluation)
-        self._persist(model)
-        return model
-
-    def promote_candidate(
-        self,
-        name: str,
-        version: str,
-    ) -> PromotionDecision:
-        model = self.get(name, version)
-        decision = evaluate_promotion(model)
-        if decision.allowed:
-            previous = model.stage
-            validate_transition(previous, "candidate")
-            model.stage = "candidate"
-            self._persist(model)
-            if previous != "candidate":
-                self._record_transition(
-                    model,
-                    from_stage=previous,
-                    to_stage="candidate",
-                    reason="promotion policy satisfied",
+    def add_evaluation(self, name: str, version: str, evaluation: Evaluation) -> ModelVersion:
+        with self._write() as connection:
+            model = self.get(name, version)
+            model = replace(model, evaluations=[*model.evaluations, evaluation])
+            if connection is None:
+                self._models[model.key] = model
+            else:
+                connection.execute(
+                    "UPDATE model_versions SET evaluations_json = ? WHERE model_key = ?",
+                    (self._evaluations_json(model), model.key),
                 )
-        return decision
+            return model
+
+    def _transition(self, model: ModelVersion, stage: str, reason: str) -> None:
+        validate_transition(model.stage, stage)
+        self._record_transition(model, from_stage=model.stage, to_stage=stage, reason=reason)
+        if self.database_path is None:
+            self._models[model.key] = replace(model, stage=stage)
+        else:
+            with self._read() as connection:
+                connection.execute(
+                    "UPDATE model_versions SET stage = ? WHERE model_key = ?", (stage, model.key)
+                )
+
+    def promote_candidate(self, name: str, version: str) -> PromotionDecision:
+        with self._write():
+            model = self.get(name, version)
+            decision = evaluate_promotion(model)
+            if decision.allowed:
+                self._transition(model, "candidate", "promotion policy satisfied")
+            return decision
 
     def promote_production(self, name: str, version: str) -> None:
-        model = self.get(name, version)
-        validate_transition(model.stage, "production")
-        if not evaluate_promotion(model).allowed:
-            raise ValueError("Current evaluations no longer satisfy promotion policy.")
-
-        changes: list[tuple[ModelVersion, str, str, str]] = []
-        for other in self._models.values():
-            if other.name == name and other.stage == "production":
-                validate_transition(other.stage, "archived")
-                changes.append(
-                    (
-                        other,
-                        other.stage,
-                        "archived",
-                        "replaced by newer production version",
-                    )
-                )
-
-        changes.append(
-            (
-                model,
-                model.stage,
-                "production",
-                "candidate promoted to production",
+        """Apply the basic transition only to a standalone registry."""
+        with self._write() as connection:
+            governed = self._governed or (
+                connection is not None
+                and connection.execute(
+                    "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='candidate_evidence'"
+                ).fetchone() is not None
             )
-        )
-        events = [
-            LifecycleEvent(
-                model_key=item.key,
-                from_stage=from_stage,
-                to_stage=to_stage,
-                reason=reason,
-            )
-            for item, from_stage, to_stage, reason in changes
-        ]
+            if governed:
+                raise ValueError("Use GovernanceService to promote in a governed registry.")
+            self._promote_production(name, version)
 
-        if self.database_path is not None:
-            # Promotion, archival and audit events must commit as one unit. This
-            # prevents crashes/concurrent writers from leaving no production
-            # model or two production rows.
-            with closing(self._connect()) as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                for item, from_stage, to_stage, _ in changes:
-                    cursor = connection.execute(
-                        """
-                        UPDATE model_versions
-                        SET stage = ?
-                        WHERE model_key = ? AND stage = ?
-                        """,
-                        (to_stage, item.key, from_stage),
-                    )
-                    if cursor.rowcount != 1:
-                        raise RuntimeError(
-                            f"Concurrent lifecycle update detected for {item.key}."
-                        )
-                for event in events:
-                    connection.execute(
-                        """
-                        INSERT INTO lifecycle_events(
-                            model_key, from_stage, to_stage, reason, created_at
-                        )
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (
-                            event.model_key,
-                            event.from_stage,
-                            event.to_stage,
-                            event.reason,
-                            event.created_at,
-                        ),
-                    )
-                connection.commit()
-
-        for item, _, to_stage, _ in changes:
-            item.stage = to_stage
-        self._events.extend(events)
+    def _promote_production(self, name: str, version: str) -> None:
+        with self._write():
+            model = self.get(name, version)
+            validate_transition(model.stage, "production")
+            if not evaluate_promotion(model).allowed:
+                raise ValueError("Current evaluations no longer satisfy promotion policy.")
+            for other in self.list():
+                if other.name == name and other.stage == "production":
+                    self._transition(other, "archived", "replaced by newer production version")
+            self._transition(model, "production", "candidate promoted to production")
 
     def list(self) -> list[ModelVersion]:
-        self._refresh()
-        return sorted(
-            self._models.values(),
-            key=lambda item: (item.name, item.version),
-        )
+        return self._select()

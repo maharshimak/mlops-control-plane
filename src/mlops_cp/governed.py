@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Sequence
-from contextlib import closing
-from dataclasses import dataclass, field
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -38,12 +38,18 @@ from mlops_cp.artifacts import (
     digest_file,
     resolve_confined,
 )
-from mlops_cp.audit import AuditLog
+from mlops_cp.audit import AuditLog, sha256_json, verify_chain
 from mlops_cp.drift import drift_severity, population_stability_index
 from mlops_cp.evidence import CandidateEvidence
 from mlops_cp.models import ModelVersion, utc_now
 from mlops_cp.policy import evaluate_promotion as evaluate_basic_gates
 from mlops_cp.registry import ModelRegistry
+from mlops_cp.storage import connect, transaction
+
+
+def _evaluation_digest(model: ModelVersion) -> str:
+    return sha256_json(json.dumps([asdict(item) for item in model.evaluations], sort_keys=True))
+
 
 Decision = Literal["allow", "deny", "requires_approval"]
 _SEVERITY_RANK = {"stable": 0, "warning": 1, "critical": 2}
@@ -125,29 +131,55 @@ class GovernanceService:
         database_path: str | None = None,
         policy: PromotionPolicyConfig | None = None,
         artifact_root: str | None = None,
+        trusted_inputs: bool = True,
     ) -> None:
         if database_path == ":memory:":
             raise ValueError("use database_path=None for in-memory governance state")
-        self.registry = registry if registry is not None else ModelRegistry(database_path)
-        self.database_path = database_path
+        path = str(Path(database_path).expanduser().resolve()) if database_path else None
+        self.registry = registry if registry is not None else ModelRegistry(path)
+        if path is not None and self.registry.database_path != path:
+            raise ValueError("Registry and governance must share one SQLite database.")
+        self.database_path = self.registry.database_path
+        self.registry._governed = True
         self.policy = policy or PromotionPolicyConfig()
         self.artifact_root = artifact_root
-        self.audit = AuditLog(database_path)
+        self.trusted_inputs = trusted_inputs
+        self.audit = AuditLog(self.database_path)
+        if self.database_path is None:
+            self.audit._lock = self.registry._lock
         self._evidence: dict[str, tuple[CandidateEvidence, str]] = {}
         self._approvals: list[Approval] = []
-        if database_path is not None:
+        if self.database_path is not None:
             self._initialize_storage()
 
     # ------------------------------------------------------------------ storage
-    def _connect(self) -> sqlite3.Connection:
-        assert self.database_path is not None
-        Path(self.database_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.database_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        return connection
+    @contextmanager
+    def _write(self) -> Iterator[None]:
+        if self.database_path is not None:
+            with transaction(self.database_path):
+                yield
+            return
+        # In-memory operations share the registry lock. Its writes replace model
+        # objects, so restoring the original mappings also restores the old stages.
+        with self.registry._lock:
+            models = self.registry._models.copy()
+            lifecycle_length = len(self.registry._events)
+            evidence = self._evidence.copy()
+            approvals_length = len(self._approvals)
+            audit_length = len(self.audit._events)
+            try:
+                yield
+            except BaseException:
+                self.registry._models = models
+                del self.registry._events[lifecycle_length:]
+                self._evidence = evidence
+                del self._approvals[approvals_length:]
+                del self.audit._events[audit_length:]
+                raise
 
     def _initialize_storage(self) -> None:
-        with closing(self._connect()) as connection:
+        assert self.database_path is not None
+        with connect(self.database_path) as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS candidate_evidence (
@@ -181,8 +213,10 @@ class GovernanceService:
 
     def evidence(self, model_key: str) -> tuple[CandidateEvidence, str] | None:
         if self.database_path is None:
-            return self._evidence.get(model_key)
-        with closing(self._connect()) as connection:
+            with self.registry._lock:
+                recorded = self._evidence.get(model_key)
+                return (recorded[0].model_copy(deep=True), recorded[1]) if recorded else None
+        with connect(self.database_path) as connection:
             row = connection.execute(
                 "SELECT evidence_json, evidence_sha256 FROM candidate_evidence "
                 "WHERE model_key = ?",
@@ -199,10 +233,10 @@ class GovernanceService:
                 raise GovernanceError(
                     f"evidence already recorded for {evidence.model_key}", code="CONFLICT"
                 )
-            self._evidence[evidence.model_key] = (evidence, digest)
+            self._evidence[evidence.model_key] = (evidence.model_copy(deep=True), digest)
             return
         try:
-            with closing(self._connect()) as connection, connection:
+            with transaction(self.database_path) as connection:
                 connection.execute(
                     "INSERT INTO candidate_evidence(model_key, evidence_json, "
                     "evidence_sha256, recorded_at) VALUES (?, ?, ?, ?)",
@@ -216,8 +250,9 @@ class GovernanceService:
 
     def approvals(self, model_key: str) -> list[Approval]:
         if self.database_path is None:
-            return [item for item in self._approvals if item.model_key == model_key]
-        with closing(self._connect()) as connection:
+            with self.registry._lock:
+                return [item for item in self._approvals if item.model_key == model_key]
+        with connect(self.database_path) as connection:
             rows = connection.execute(
                 "SELECT * FROM approvals WHERE model_key = ? ORDER BY created_at, approver",
                 (model_key,),
@@ -226,39 +261,37 @@ class GovernanceService:
 
     # --------------------------------------------------------------- operations
     def register_candidate(self, evidence: CandidateEvidence) -> tuple[ModelVersion, str]:
-        """Register a model version from pipeline evidence.
-
-        Steps are ordered so that any partial failure fails closed: a model row
-        without its evidence row can never pass :meth:`evaluate_promotion`.
-        """
+        """Atomically register validated evidence, model state and audit records."""
+        evidence = CandidateEvidence.model_validate(evidence.canonical())
+        digest = evidence.sha256()
         model = ModelVersion(
             name=evidence.model_name,
             version=evidence.model_version,
             artifact_uri=evidence.artifact_uri,
             dataset_fingerprint=evidence.dataset_fingerprint,
+            evaluations=[metric.to_evaluation() for metric in evidence.metrics],
         )
-        try:
-            self.registry.register(model)
-        except ValueError as error:
-            raise GovernanceError(str(error), code="CONFLICT") from error
-        for metric in evidence.metrics:
-            self.registry.add_evaluation(model.name, model.version, metric.to_evaluation())
-        digest = evidence.sha256()
-        self._store_evidence(evidence, digest)
-        self.audit.append(
-            "candidate_registered",
-            evidence.model_key,
-            {
-                "evidence_sha256": digest,
-                "artifact_sha256": evidence.artifact_sha256,
-                "dataset_fingerprint": evidence.dataset_fingerprint,
-                "config_sha256": evidence.config_sha256,
-                "code_version": evidence.code_version,
-                "producer": evidence.producer,
-                "metrics": sorted(item.name for item in evidence.metrics),
-            },
-        )
-        return self.registry.get(model.name, model.version), digest
+        with self._write():
+            try:
+                self.registry.register(model)
+            except ValueError as error:
+                raise GovernanceError(str(error), code="CONFLICT") from error
+            self._store_evidence(evidence, digest)
+            self.audit.append(
+                "candidate_registered",
+                evidence.model_key,
+                {
+                    "evidence_sha256": digest,
+                    "artifact_sha256": evidence.artifact_sha256,
+                    "dataset_fingerprint": evidence.dataset_fingerprint,
+                    "config_sha256": evidence.config_sha256,
+                    "code_version": evidence.code_version,
+                    "producer": evidence.producer,
+                    "trusted_source": self.trusted_inputs,
+                    "metrics": sorted(item.name for item in evidence.metrics),
+                },
+            )
+        return model, digest
 
     def verify_artifact(
         self,
@@ -270,31 +303,35 @@ class GovernanceService:
     ) -> ArtifactVerification:
         if (path is None) == (content is None):
             raise GovernanceError("provide exactly one of path or content")
-        model_key = f"{name}:{version}"
-        self.registry.get(name, version)  # KeyError when unknown
-        recorded = self.evidence(model_key)
-        if recorded is None:
-            raise GovernanceError(f"no candidate evidence recorded for {model_key}")
-        expected = recorded[0].artifact_sha256
-        if path is not None:
-            if not self.artifact_root:
-                raise PermissionError("artifact root is not configured")
-            digest = digest_file(resolve_confined(self.artifact_root, path))
-        else:
-            assert content is not None
-            digest = digest_bytes(content)
-        result = compare_digest(expected, digest)
-        self.audit.append(
-            "artifact_verification",
-            model_key,
-            {
-                "verified": result.verified,
-                "expected_sha256": result.expected_sha256,
-                "actual_sha256": result.actual_sha256,
-                "size_bytes": result.size_bytes,
-            },
-        )
-        return result
+        with self._write():
+            model_key = f"{name}:{version}"
+            self.registry.get(name, version)  # KeyError when unknown
+            recorded = self.evidence(model_key)
+            if recorded is None:
+                raise GovernanceError(f"no candidate evidence recorded for {model_key}")
+            expected = recorded[0].artifact_sha256
+            if path is not None:
+                if not self.artifact_root:
+                    raise PermissionError("artifact root is not configured")
+                digest = digest_file(resolve_confined(self.artifact_root, path))
+            else:
+                assert content is not None
+                digest = digest_bytes(content)
+            result = compare_digest(expected, digest)
+            self.audit.append(
+                "artifact_verification",
+                model_key,
+                {
+                    "verified": result.verified,
+                    "expected_sha256": result.expected_sha256,
+                    "actual_sha256": result.actual_sha256,
+                    "size_bytes": result.size_bytes,
+                    "source": "path" if path is not None else "bytes",
+                    "relative_path": path,
+                    "trusted_source": self.trusted_inputs,
+                },
+            )
+            return result
 
     def record_approval(self, name: str, version: str, approver: str, note: str = "") -> Approval:
         approver = approver.strip()
@@ -302,36 +339,50 @@ class GovernanceService:
             raise GovernanceError("approver must be 1-200 characters")
         if len(note) > 2000:
             raise GovernanceError("note must be at most 2000 characters")
+        if not self.trusted_inputs:
+            raise GovernanceError("Approval requires a trusted individual principal.")
         model_key = f"{name}:{version}"
-        self.registry.get(name, version)
-        recorded = self.evidence(model_key)
-        if recorded is None:
-            raise GovernanceError(f"no candidate evidence recorded for {model_key}")
-        evidence, digest = recorded
-        if evidence.submitted_by is not None and evidence.submitted_by == approver:
-            raise GovernanceError("separation of duties: the submitter cannot approve")
-        approval = Approval(model_key, approver, digest, note, utc_now())
-        if self.database_path is None:
-            if any(item.approver == approver for item in self.approvals(model_key)):
+        with self._write():
+            model = self.registry.get(name, version)
+            recorded = self.evidence(model_key)
+            if recorded is None:
+                raise GovernanceError(f"no candidate evidence recorded for {model_key}")
+            evidence, digest = recorded
+            if evidence.submitted_by is None or evidence.submitted_by.strip() == approver:
+                raise GovernanceError("separation of duties requires distinct submitter and approver")
+            if digest != evidence.sha256():
+                raise GovernanceError("candidate evidence digest does not match")
+            snapshot = _evaluation_digest(model)
+            prior = next((item for item in self.approvals(model_key) if item.approver == approver),
+                         None)
+            prior_review = next(
+                (event for event in reversed(self.audit.events(model_key))
+                 if event.event_type == "approval_recorded"
+                 and event.payload.get("approver") == approver),
+                None,
+            )
+            if prior_review and prior_review.payload.get("evaluations_sha256") == snapshot:
                 raise GovernanceError(f"{approver} already approved {model_key}", code="CONFLICT")
-            self._approvals.append(approval)
-        else:
-            try:
-                with closing(self._connect()) as connection, connection:
-                    connection.execute(
-                        "INSERT INTO approvals(model_key, approver, evidence_sha256, note, "
-                        "created_at) VALUES (?, ?, ?, ?, ?)",
-                        (approval.model_key, approval.approver, approval.evidence_sha256,
-                         approval.note, approval.created_at),
-                    )
-            except sqlite3.IntegrityError as error:
-                raise GovernanceError(f"{approver} already approved {model_key}", code="CONFLICT") from error
-        self.audit.append(
-            "approval_recorded",
-            model_key,
-            {"approver": approver, "evidence_sha256": digest},
-        )
+            approval = Approval(model_key, approver, digest, note, utc_now())
+            if prior is None:
+                if self.database_path is None:
+                    self._approvals.append(approval)
+                else:
+                    with transaction(self.database_path) as connection:
+                        connection.execute(
+                            "INSERT INTO approvals(model_key, approver, evidence_sha256, note, "
+                            "created_at) VALUES (?, ?, ?, ?, ?)",
+                            (approval.model_key, approval.approver, approval.evidence_sha256,
+                             approval.note, approval.created_at),
+                        )
+            self.audit.append(
+                "approval_recorded",
+                model_key,
+                {"approver": approver, "evidence_sha256": digest,
+                 "evaluations_sha256": snapshot, "approval_note": note},
+            )
         return approval
+
 
     def evaluate_promotion(
         self,
@@ -348,7 +399,9 @@ class GovernanceService:
         warnings: list[str] = []
         checks: dict[str, bool] = {}
 
-        chain = self.audit.verify()
+        audit_events = self.audit.events()
+        chain = verify_chain(audit_events)
+        model_events = [event for event in audit_events if event.subject == model_key]
         checks["audit_chain_intact"] = chain.valid
         if not chain.valid:
             reasons.append(f"audit log integrity failure at seq {chain.first_invalid_seq}: "
@@ -368,6 +421,14 @@ class GovernanceService:
                 evidence.artifact_uri == model.artifact_uri
                 and evidence.dataset_fingerprint == model.dataset_fingerprint
             )
+            checks["evidence_digest_verified"] = (
+                evidence.sha256() == evidence_digest
+                and any(event.event_type == "candidate_registered"
+                        and event.payload.get("evidence_sha256") == evidence_digest
+                        for event in model_events)
+            )
+            if not checks["evidence_digest_verified"]:
+                reasons.append("candidate evidence digest does not match the audited registration")
             checks["evidence_matches_registry"] = consistent
             if not consistent:
                 reasons.append("registry artifact URI or dataset fingerprint differs from evidence")
@@ -386,14 +447,19 @@ class GovernanceService:
             verified = False
             if evidence is not None:
                 verifications = [
-                    e for e in self.audit.events(model_key)
-                    if e.event_type == "artifact_verification"
+                    event for event in model_events if event.event_type == "artifact_verification"
                 ]
                 if verifications:
                     latest = verifications[-1].payload
                     verified = bool(latest.get("verified")) and (
                         latest.get("actual_sha256") == evidence.artifact_sha256
                     )
+                    if verified and latest.get("source") == "path":
+                        verified = self._verify_current_file(
+                            model, latest.get("relative_path"), evidence.artifact_sha256
+                        )
+                    elif verified:
+                        verified = latest.get("source") == "bytes"
                     if not verified:
                         reasons.append("latest artifact verification failed")
                 else:
@@ -401,7 +467,7 @@ class GovernanceService:
             checks["artifact_verified"] = verified
 
         gates = evaluate_basic_gates(model)
-        present = {item.metric for item in model.evaluations}
+        present = {item.name for item in evidence.metrics} if evidence is not None else set()
         missing = sorted(set(policy.required_metrics) - present)
         checks["evaluation_gates"] = gates.allowed and not missing
         reasons.extend(f"evaluation gate: {reason}" for reason in gates.reasons)
@@ -430,10 +496,19 @@ class GovernanceService:
                 warnings.append("no drift evidence supplied")
         checks["drift_within_policy"] = drift_ok
 
+        snapshot = _evaluation_digest(model)
+        reviews = {
+            event.payload.get("approver"): event.payload
+            for event in model_events if event.event_type == "approval_recorded"
+        }
         approvers = tuple(
             item.approver
             for item in self.approvals(model_key)
-            if evidence_digest is not None and item.evidence_sha256 == evidence_digest
+            if self.trusted_inputs and evidence is not None and evidence.submitted_by
+            and item.approver != evidence.submitted_by.strip()
+            and item.evidence_sha256 == evidence_digest
+            and reviews.get(item.approver, {}).get("evidence_sha256") == evidence_digest
+            and reviews.get(item.approver, {}).get("evaluations_sha256") == snapshot
         )
         approvals_ok = len(approvers) >= policy.required_approvals
         checks["approvals"] = approvals_ok
@@ -461,6 +536,20 @@ class GovernanceService:
             drift=tuple(drift_results),
         )
 
+    def _verify_current_file(
+        self, model: ModelVersion, relative_path: str | None, expected_sha256: str
+    ) -> bool:
+        if self.artifact_root is None or relative_path is None:
+            return False
+        try:
+            path = resolve_confined(self.artifact_root, relative_path)
+            return (
+                model.artifact_uri == path.as_uri()
+                and compare_digest(expected_sha256, digest_file(path)).verified
+            )
+        except (OSError, ValueError):
+            return False
+
     def promote_to_production(
         self,
         name: str,
@@ -472,20 +561,42 @@ class GovernanceService:
 
         This changes registry state and the audit log; it does not deploy.
         """
-        decision = self.evaluate_promotion(name, version, drift=drift)
-        if decision.decision != "allow":
+        with self._write():
+            decision = self.evaluate_promotion(name, version, drift=drift)
+            if decision.decision != "allow":
+                return decision
+            events = self.audit.events(decision.model_key)
+            trusted_registration = any(
+                event.event_type == "candidate_registered"
+                and event.payload.get("trusted_source") is True
+                and event.payload.get("evidence_sha256") == decision.evidence_sha256
+                for event in events
+            )
+            verification = next(
+                (event for event in reversed(events) if event.event_type == "artifact_verification"),
+                None,
+            )
+            trusted_artifact = not self.policy.require_artifact_verification or (
+                verification is not None and verification.payload.get("trusted_source") is True
+            )
+            if not (self.trusted_inputs and trusted_registration and trusted_artifact):
+                return replace(
+                    decision,
+                    decision="deny",
+                    reasons=("production requires trusted registration and verification",),
+                    checks={**decision.checks, "trusted_promotion_inputs": False},
+                )
+            model = self.registry.get(name, version)
+            if (
+                model.stage == "registered"
+                and not self.registry.promote_candidate(name, version).allowed
+            ):
+                raise GovernanceError("registry candidate gate rejected the model")
+            self.registry._promote_production(name, version)
+            self.audit.append(
+                "promoted_to_production",
+                decision.model_key,
+                {"evidence_sha256": decision.evidence_sha256,
+                 "approvals": list(decision.approvals)},
+            )
             return decision
-        model = self.registry.get(name, version)
-        if (
-            model.stage == "registered"
-            and not self.registry.promote_candidate(name, version).allowed
-        ):
-            raise GovernanceError("registry candidate gate rejected the model")
-        self.registry.promote_production(name, version)
-        self.audit.append(
-            "promoted_to_production",
-            decision.model_key,
-            {"evidence_sha256": decision.evidence_sha256,
-             "approvals": list(decision.approvals)},
-        )
-        return decision

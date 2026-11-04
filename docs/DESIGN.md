@@ -22,8 +22,8 @@ Trust boundaries:
 - `mlops-production-pipeline` exports (`mlops-candidate-evaluation.v1`) are validated against a vendored copy of that repository's JSON Schema and mapped field by field; the pipeline's own gate is binding (a rejected gate denies promotion). Its `run_record_sha256` is stored as a claim; the run record is not supplied, so it is not re-verified.
 - The promotion policy is server configuration. Requests can supply drift observations but cannot relax approvals, required metrics or drift thresholds.
 - The audit chain is tamper-evident, not tamper-proof: no signatures or external anchoring are built in. Tail truncation is detected only against a caller-held `expected_head`.
-- Writes across stores are not one transaction. Ordering makes partial failures fail closed (a model without evidence, or without a verification event, is denied).
-- The older `/candidate` and `/production` REST routes keep their original basic gate; open PRs #12-#15 harden those registry paths. The governed policy is applied by `GovernanceService.promote_to_production` and reported by the `evaluate_promotion` contract operation.
+- SQLite writers acquire the lock before reading the decision inputs. Registrations, approvals and production transitions commit with their lifecycle and audit events. Failed writes roll back the whole operation.
+- The HTTP candidate route applies the basic gate. The HTTP production and approval routes return 403 under the shared credential model. The trusted Python governance service can commit a production transition after rechecking the current state, source provenance, verification, policy and approvals.
 
 ## Interfaces
 
@@ -35,4 +35,4 @@ Tests include synthetic regression fixtures, adversarial audit-chain tampering, 
 
 ## Planned evolution
 
-Single-transaction multi-store writes; signed artifacts and signed or externally anchored audit heads; per-user authenticated approvals; routing legacy promotion routes through the governed policy; deployment adapters behind explicit configuration.
+Signed evidence and artifacts, externally anchored audit heads, per-user authenticated HTTP approvals and trusted deployment integrations.

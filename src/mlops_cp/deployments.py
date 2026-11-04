@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Protocol
-from urllib import parse, request
+from urllib import error, parse, request
 
 from mlops_cp.models import ModelVersion
 from mlops_cp.progressive import RolloutDecision
@@ -33,6 +33,11 @@ class DeploymentReceipt:
     accepted: bool
     deployment_id: str | None
     detail: str
+
+
+class _NoRedirect(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise error.HTTPError(req.full_url, code, "Deployment redirects are disabled", headers, fp)
 
 
 class DeploymentTarget(Protocol):
@@ -75,10 +80,11 @@ class HTTPDeploymentTarget:
         if self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
         req = request.Request(self.endpoint, data=payload, headers=headers, method="POST")
-        with request.urlopen(req, timeout=self.timeout_seconds) as response:
+        opener = request.build_opener(_NoRedirect())
+        with opener.open(req, timeout=self.timeout_seconds) as response:
             body = json.loads(response.read().decode() or "{}")
         return DeploymentReceipt(
-            accepted=bool(body.get("accepted", False)),
+            accepted=body.get("accepted") is True,
             deployment_id=(
                 str(body["deployment_id"]) if body.get("deployment_id") is not None else None
             ),

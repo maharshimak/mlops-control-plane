@@ -134,11 +134,11 @@ if decision.allowed:
   | (wrapper) `model_name`, `model_version`, `artifact_uri`, `submitted_by` | same names; `producer` = `mlops-production-pipeline` |
 
   A pipeline gate with `allowed: false` is recorded at registration and is a blocking promotion reason (`pipeline gate rejected candidate: ...`). `run_record_sha256` is stored but not re-verified, since the run record itself is not supplied.
-- **Artifact integrity**: `verify_artifact` hashes artifact bytes (supplied inline, or read from a relative path confined to `MLOPS_CP_ARTIFACT_ROOT`; absolute paths, `..` traversal and escaping symlinks are refused) and compares them with the registered `artifact_sha256`. Every attempt, successful or not, is written to the audit log; the latest attempt decides.
+- **Artifact integrity.** Verification compares SHA-256 against registered evidence. Path-based promotion requires the confined file's canonical `file:` URI and a fresh hash match. Trusted Python callers using inline bytes are responsible for supplying the actual artifact bytes. Remote URIs require a trusted integration that reads the artifact. The artifact root must be controlled by the operator, and a deployment controller must verify the pinned digest when it consumes the artifact.
 - **Promotion policy** (`evaluate_promotion`) reports every failing reason at once: audit chain intact, promotable lifecycle stage, evidence recorded and consistent with the registry row, artifact verified, all evaluation gates passing plus any server-configured required metrics, no drift at or above the denial severity (PSI computed from supplied bin counts), and enough distinct approvals. If approvals are the only thing missing, the decision is `requires_approval`; otherwise `deny`. The policy is configured on the service (`MLOPS_CP_REQUIRED_APPROVALS`, default 1; `MLOPS_CP_REQUIRED_METRICS`, comma-separated), not by the request being judged.
-- **Approvals**: one per approver per model, bound to the evidence digest; the evidence submitter cannot approve their own model. `POST /v1/governance/{name}/{version}/approvals` records one. The approver name is asserted by the caller; there is no per-user identity behind the shared bearer token.
+- **Approvals.** Trusted Python callers must supply a verified individual principal, distinct from the verified submitter. A review is bound to the evidence and current evaluation snapshot. Changes require a fresh review. The HTTP approval route returns 403 because a shared bearer token and a request-supplied name cannot establish identity. Reviews created before snapshot binding do not count toward promotion.
 - **Audit log** (`mlops_cp.audit.AuditLog`): append-only, hash-chained events. Each event stores `prev_hash` and a SHA-256 over its canonical JSON. `verify()` detects edited, inserted, deleted or reordered events; SQLite triggers additionally reject `UPDATE`/`DELETE`. Removing events from the end of the chain is only detected when the caller supplies a previously recorded head hash (`expected_head`). This is tamper evidence, not a signature: someone who can rewrite the whole database can recompute the chain.
-- `promote_to_production` changes the registry stage only when the decision is `allow`, and records the promotion in the audit log. Nothing in this package deploys a model or changes live traffic.
+- `GovernanceService.promote_to_production` revalidates trusted evidence, artifact verification, gates, drift and approvals inside the same transaction as registry transitions and audit records. The result describes a registry change only. The optional HTTP deployment adapter sends a command to its configured endpoint, refuses redirects and reports the controller's acceptance. A rollback decision does not execute a deployment.
 
 ## makma.v1 contract
 
@@ -156,7 +156,7 @@ Unknown operations return `UNKNOWN_OPERATION`; schema violations return `INVALID
 
 ## Scope and limitations
 
-The API registry is SQLite-backed by default and persists model versions, evaluations, current stages and lifecycle transition events across restart. Governance evidence, approvals and the audit log live in the same SQLite file. JSONL state, lineage and canary helpers remain separate utilities rather than deployment integrations. Artifact digests are verified only when `verify_artifact` is called with the bytes or a confined local path; remote URIs are not fetched, and there are no signatures. The original `POST /v1/models/{name}/{version}/candidate` and `/production` routes still apply only the basic evaluation gate; the governed policy is enforced by `GovernanceService.promote_to_production` and reported by `evaluate_promotion`. Registration from evidence and its evidence row are separate writes: a crash between them leaves a model without evidence, which the policy then denies. Library callers receive mutable model objects and are trusted. No external rollout controller or automated infrastructure rollback is implemented.
+The API registry persists model versions, evaluations, stages, lifecycle events and governance records in the same SQLite database. Governed writes and their audit records commit together. `makma.v1` registration, verification and policy previews remain available over HTTP. Existing HTTP production and approval routes fail closed with 403. Trusted Python governance requires evidence registered and verified through the trusted service. Records without source provenance must be registered again under a new model version. The basic registry production method remains available for standalone Python registries.
 
 ## Installation and development
 
@@ -218,7 +218,7 @@ docker run --rm -p 127.0.0.1:8000:8000 mlops-control-plane
 
 ## Next engineering work
 
-Transactional multi-writer persistence; artifact signatures; per-user authenticated approvals; routing the legacy promotion routes through the governed policy; real deployment adapters. These are planned work, not current capabilities.
+Authenticated HTTP submitters and approvers, signed evidence and artifacts, external audit anchoring, and integration with a real deployment controller remain future work.
 
 ## Contributing and security
 

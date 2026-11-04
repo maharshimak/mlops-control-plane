@@ -1,4 +1,4 @@
-from math import isfinite, log
+from math import fsum, isfinite, log
 
 
 def population_stability_index(
@@ -13,17 +13,23 @@ def population_stability_index(
         raise ValueError("epsilon must be finite and positive.")
     if any(not isfinite(v) or v < 0 for v in [*expected, *actual]):
         raise ValueError("Bin counts must be finite and non-negative.")
-    expected_total = sum(expected)
-    actual_total = sum(actual)
-    if expected_total <= 0 or actual_total <= 0:
-        raise ValueError("Distribution totals must be positive.")
-
+    expected_proportions = _proportions(expected)
+    actual_proportions = _proportions(actual)
     score = 0.0
-    for expected_count, actual_count in zip(expected, actual):
-        e = max(expected_count / expected_total, epsilon)
-        a = max(actual_count / actual_total, epsilon)
-        score += (a - e) * log(a / e)
+    for expected_fraction, actual_fraction in zip(expected_proportions, actual_proportions):
+        e = max(expected_fraction, epsilon)
+        a = max(actual_fraction, epsilon)
+        score += (a - e) * (log(a) - log(e))
     return score
+
+
+def _proportions(counts: list[float]) -> list[float]:
+    peak = max(counts)
+    if peak <= 0:
+        raise ValueError("Distribution totals must be positive.")
+    scaled = [count / peak for count in counts]
+    total = fsum(scaled)
+    return [count / total for count in scaled]
 
 
 def drift_severity(psi: float) -> str:

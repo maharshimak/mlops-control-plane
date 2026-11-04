@@ -60,6 +60,8 @@ def resolve_confined(root: str | Path, relative_path: str) -> Path:
     candidate = Path(relative_path)
     if candidate.is_absolute() or candidate.drive or candidate.anchor:
         raise ArtifactAccessError("artifact path must be relative to the artifact root")
+    if ".." in candidate.parts:
+        raise ArtifactAccessError("artifact path cannot contain parent traversal")
     base = Path(root).expanduser().resolve(strict=True)
     resolved = (base / candidate).resolve(strict=False)
     if not resolved.is_relative_to(base):
